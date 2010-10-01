@@ -1,0 +1,6 @@
+[submodule "nox.git"]
+	path = nox.git
+	url = git://github.com/mor1/nox
+[submodule "openvswitch.git"]
+	path = openvswitch.git
+	url = git://github.com/mor1/openvswitch
