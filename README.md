@@ -77,44 +77,44 @@ terminal, ie., will need running in separate terminals.  If you want,
 investigate the man pages for `ovsdb-server` and `ovs-vswitchd` to see
 how to run then as background daemons.
 
-* replace the bridge module with the openvswitch equivalents (datapath)
+replace the bridge module with the openvswitch equivalents (datapath)
 
     $ cd ${ROOT}
     $ sudo rmmod bridge
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/openvswitch_mod.ko 
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/brcompat_mod.ko 
 
-2. create `ovsdb.conf` file if it doesn't exist
+create `ovsdb.conf` file if it doesn't exist
 
     $ cd openvswitch.git
     $ ovsdb-tool create ovsdb.conf vswitchd/vswitch.ovsschema
     
-2. start `ovsdb-server`
+start `ovsdb-server`
 
     $ cd ${ROOT}/openvswitch.git
     $ sudo ovsdb-server ovsdb.conf --remote=punix:/var/run/ovsdb-server
 
-3. start the secure channel between datapath and controller
+start the secure channel between datapath and controller
 
     $ sudo ovs-vswitchd unix:/var/run/ovsdb-server 
 
-4. initialise the database, create the bridge, &c
+initialise the database, create the bridge, &c
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server init
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server add-br br0
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server set-fail-mode br0 secure
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server set-controller br0 tcp:127.0.0.1:6633
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server add-port br0 wlan1
 
-5. start nox (the controller), specifying the homework script
+start nox (the controller), specifying the homework script
 
     $ cd ${ROOT}/nox.git/build/src
     $ sudo ./nox_core -v -i ptcp:localhost homework
 
-6. restart hostapd since it seems to get confused pretty much every time
+restart hostapd since it seems to get confused pretty much every time
 
     $ sudo /etc/init.d/hostapd restart
 
-7. permit a mac address to do anything; get list of all permitted
+permit a mac address to do anything; get list of all permitted
    devices; eaddr=xx:xx:xx:xx:xx:xx
 
     $ curl --noproxy localhost -X POST http://localhost/ws.v1/homework/permit/<eaddr>
@@ -123,17 +123,17 @@ how to run then as background daemons.
 Interrogation
 -------------
 
-1. permit/deny status of Homework router
+permit/deny status of Homework router
 
     $ curl --noproxy localhost -X GET http://localhost/ws.v1/homework/status 
 
-2. to see what flows have been installed in openvswitch
+to see what flows have been installed in openvswitch
 
     $ ovs-ofctl dump-flows dp0
 
-3. to see what flows are really installed in the datapath;
-   differs from above as include transient flows based on observed packets,
-   while installed flows are the actual permitted entries
+to see what flows are really installed in the datapath; differs from
+above as include transient flows based on observed packets, while
+installed flows are the actual permitted entries
 
     $ ovs-dpctl dump-flows dp0
 
