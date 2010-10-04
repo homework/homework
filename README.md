@@ -80,6 +80,8 @@ how to run then as background daemons.
 1. replace the bridge module with the openvswitch equivalents (datapath)
 
     $ cd ${ROOT}
+
+x
     $ sudo rmmod bridge
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/openvswitch_mod.ko 
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/brcompat_mod.ko 
