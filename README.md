@@ -28,8 +28,8 @@ implementation, plus an occasionally updated clone of the
 controller itself on embedded within a local branch of the
 occasionally updated [`nox` git repository][nox-home].
 
-[ovs-git]: http://openvswitch.org/
-[nox-git]: http://noxrepo.org/
+[ovs-home]: http://openvswitch.org/
+[nox-home]: http://noxrepo.org/
 
 Build and install has been tested on eeePCs running Ubuntu 10.x.  See
 <http://www.dcs.gla.ac.uk/~koliousa/hr.html> for more detail.  Build
