@@ -77,11 +77,9 @@ terminal, ie., will need running in separate terminals.  If you want,
 investigate the man pages for `ovsdb-server` and `ovs-vswitchd` to see
 how to run then as background daemons.
 
-1. replace the bridge module with the openvswitch equivalents (datapath)
+* replace the bridge module with the openvswitch equivalents (datapath)
 
     $ cd ${ROOT}
-
-x
     $ sudo rmmod bridge
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/openvswitch_mod.ko 
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/brcompat_mod.ko 
@@ -117,8 +115,7 @@ x
     $ sudo /etc/init.d/hostapd restart
 
 7. permit a mac address to do anything; get list of all permitted
-   devices drop the `| ~/jsonpretty.py` and rerun if this fails for
-   any reason; eaddr=xx:xx:xx:xx:xx:xx
+   devices; eaddr=xx:xx:xx:xx:xx:xx
 
     $ curl --noproxy localhost -X POST http://localhost/ws.v1/homework/permit/<eaddr>
 
