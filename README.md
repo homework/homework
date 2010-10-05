@@ -73,50 +73,49 @@ Having configured the eeePC as specified at
 built and installed the code as specified above, the following
 describes how to actually run things and control the Homework router.
 
-Steps (ii)--(iv) will each startup processes that take control of the
+Steps (2)--(4) will each startup processes that take control of the
 terminal, ie., will need running in separate terminals.  If you want,
 investigate the man pages for `ovsdb-server` and `ovs-vswitchd` to see
 how to run then as background daemons.
 
-(1) replace the bridge module with the openvswitch equivalents (datapath)
+(1) Replace the bridge module with the openvswitch equivalents (datapath)
 
     $ cd ${ROOT}
     $ sudo rmmod bridge
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/openvswitch_mod.ko 
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/brcompat_mod.ko 
 
-(2) create `ovsdb.conf` file if it doesn't exist
+(2) Create `ovsdb.conf` file if it doesn't exist
 
     $ cd openvswitch.git
     $ ovsdb-tool create ovsdb.conf vswitchd/vswitch.ovsschema
     
-start `ovsdb-server`
+(3) Start `ovsdb-server`
 
     $ cd ${ROOT}/openvswitch.git
     $ sudo ovsdb-server ovsdb.conf --remote=punix:/var/run/ovsdb-server
 
-start the secure channel between datapath and controller
+(4) Start `ovs-vswitchd`, the secure channel between datapath and controller
 
     $ sudo ovs-vswitchd unix:/var/run/ovsdb-server 
 
-initialise the database, create the bridge, &c
+(5) Initialise the database, create the bridge, &c
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server init
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server add-br br0
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server set-fail-mode br0 secure
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server set-controller br0 tcp:127.0.0.1:6633
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server add-port br0 wlan1
 
-start nox (the controller), specifying the homework script
+(6) Start NoX (the controller), specifying the homework script
 
     $ cd ${ROOT}/nox.git/build/src
     $ sudo ./nox_core -v -i ptcp:localhost homework
 
-restart hostapd since it seems to get confused pretty much every time
+(7) Restart hostapd since it seems to get confused pretty much every time
 
     $ sudo /etc/init.d/hostapd restart
 
-permit a mac address to do anything; get list of all permitted
-   devices; eaddr=xx:xx:xx:xx:xx:xx
+(8) Permit a mac address to do anything; eaddr=xx:xx:xx:xx:xx:xx
 
     $ curl --noproxy localhost -X POST http://localhost/ws.v1/homework/permit/<eaddr>
 
@@ -124,15 +123,15 @@ permit a mac address to do anything; get list of all permitted
 Interrogation
 -------------
 
-permit/deny status of Homework router
+Permit/deny status of Homework router
 
     $ curl --noproxy localhost -X GET http://localhost/ws.v1/homework/status 
 
-to see what flows have been installed in openvswitch
+To see what flows have been installed in openvswitch
 
     $ ovs-ofctl dump-flows dp0
 
-to see what flows are really installed in the datapath; differs from
+To see what flows are really installed in the datapath; differs from
 above as include transient flows based on observed packets, while
 installed flows are the actual permitted entries
 
