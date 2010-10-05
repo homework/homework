@@ -73,10 +73,13 @@ Having configured the eeePC as specified at
 built and installed the code as specified above, the following
 describes how to actually run things and control the Homework router.
 
-Steps (2)--(4) will each startup processes that take control of the
+Steps (2) -- (4) will each startup processes that take control of the
 terminal, ie., will need running in separate terminals.  If you want,
 investigate the man pages for `ovsdb-server` and `ovs-vswitchd` to see
 how to run then as background daemons.
+
+Steps (2), (5) need only be carried out once, or whenever the eeePC
+network configuration changes.
 
 (1) Replace the bridge module with the openvswitch equivalents (datapath)
 
