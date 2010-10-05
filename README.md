@@ -24,9 +24,9 @@ the complete set of code is a two-stage process:
 
 This will give you scripts and documentation associated with this
 implementation, plus an occasionally updated clone of the
-[`openvswitch` git repository][ovs-home] and the `homework` NoX
+[Open vSwitch git repository][ovs-home] and the `homework` NoX
 controller itself on embedded within a local branch of the
-occasionally updated [`nox` git repository][nox-home].
+occasionally updated [NoX git repository][nox-home].
 
 [ovs-home]: http://openvswitch.org/
 [nox-home]: http://noxrepo.org/
@@ -36,9 +36,9 @@ Build and install has been tested on eeePCs running Ubuntu 10.x.  See
 and install requires the following packages:
 
     $ sudo apt-get install autoconf automake libtool pkg-config g++ python \
-      python-twisted swig libxerces-c2-dev libssl-dev make \
-      libsqlite3-dev python-simplejson python-sphinx libboost1.40-dev \
-      libboost-filesystem1.40-dev libboost-test1.40-dev 
+           python-twisted swig libxerces-c2-dev libssl-dev make \
+           libsqlite3-dev python-simplejson python-sphinx libboost1.40-dev \
+           libboost-filesystem1.40-dev libboost-test1.40-dev 
 
 Subsequent instructions assume `ROOT` is set to the directory into
 which you cloned this repository.
@@ -51,7 +51,7 @@ Follow the build and install instructions as given; in short:
     $ cd ${ROOT}/openvswitch.git/
     $ ./boot.sh
     $ ./configure --with-l26=/lib/modules/`uname -r`/build
-    $ make -j4
+    $ make -j4 && make
     $ sudo make install
 
 Building NoX
@@ -60,8 +60,9 @@ Building NoX
     $ cd ${ROOT}/nox.git/
     $ ./boot.sh
     $ mkdir build && cd build && ../configure
-    $ make
+    $ make -j4 && make
     $ cd src && make check
+    $ cd etc && for n in noxca.key* ; do mv $n ${n}.disabled ; done
 
 
 Starting the Homework Router
@@ -72,19 +73,19 @@ Having configured the eeePC as specified at
 built and installed the code as specified above, the following
 describes how to actually run things and control the Homework router.
 
-Steps 2,3,4 will each startup processes that take control of the
+Steps (ii)--(iv) will each startup processes that take control of the
 terminal, ie., will need running in separate terminals.  If you want,
 investigate the man pages for `ovsdb-server` and `ovs-vswitchd` to see
 how to run then as background daemons.
 
-replace the bridge module with the openvswitch equivalents (datapath)
+(1) replace the bridge module with the openvswitch equivalents (datapath)
 
     $ cd ${ROOT}
     $ sudo rmmod bridge
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/openvswitch_mod.ko 
     $ sudo insmod ./openvswitch.git/datapath/linux-2.6/brcompat_mod.ko 
 
-create `ovsdb.conf` file if it doesn't exist
+(2) create `ovsdb.conf` file if it doesn't exist
 
     $ cd openvswitch.git
     $ ovsdb-tool create ovsdb.conf vswitchd/vswitch.ovsschema
