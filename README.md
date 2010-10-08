@@ -20,6 +20,7 @@ reference other repositories within your own.  As a result, obtaining
 the complete set of code is a two-stage process:
 
     $ git clone git://github.com/mor1/homework.git
+    $ cd homework
     $ git submodule init && git submodule update
 
 This will give you scripts and documentation associated with this
@@ -36,9 +37,9 @@ Build and install has been tested on eeePCs running Ubuntu 10.x.  See
 and install requires the following packages:
 
     $ sudo apt-get install autoconf automake libtool pkg-config g++ python \
-           python-twisted swig libxerces-c2-dev libssl-dev make \
+           python-dev python-twisted swig libxerces-c2-dev libssl-dev make \
            libsqlite3-dev python-simplejson python-sphinx libboost1.40-dev \
-           libboost-filesystem1.40-dev libboost-test1.40-dev 
+           libboost-filesystem1.40-dev libboost-test1.40-dev curl
 
 Subsequent instructions assume `ROOT` is set to the directory into
 which you cloned this repository.
@@ -51,7 +52,7 @@ Follow the build and install instructions as given; in short:
     $ cd ${ROOT}/openvswitch.git/
     $ ./boot.sh
     $ ./configure --with-l26=/lib/modules/`uname -r`/build
-    $ make -j4 && make
+    $ make -j4 ; make
     $ sudo make install
 
 Building NoX
@@ -60,7 +61,7 @@ Building NoX
     $ cd ${ROOT}/nox.git/
     $ ./boot.sh
     $ mkdir build && cd build && ../configure
-    $ make -j4 && make
+    $ make -j4 ; make
     $ cd src && make check
     $ cd etc && for n in noxca.key* ; do mv $n ${n}.disabled ; done
 
