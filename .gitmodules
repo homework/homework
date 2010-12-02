@@ -1,6 +1,6 @@
 [submodule "nox.git"]
 	path = nox.git
-	url = git://github.com/homework/nox
+	url = git@github.com:homework/nox.git
 [submodule "openvswitch.git"]
 	path = openvswitch.git
-	url = git://github.com/homework/openvswitch
+	url = git@github.com:homework/openvswitch.git
