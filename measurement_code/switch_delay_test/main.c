@@ -1,10 +1,15 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <pcap.h>
 #include <sys/time.h>
+#include <sys/queue.h>
 
-#include <stdlib.h>
+#include <net/ethernet.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+
 #include <glib-object.h>
 #include <json-glib/json-glib.h>
 
@@ -14,6 +19,27 @@
 #include <curl/curl.h>
 
 #include <libconfig.h>
+
+struct pktgen_hdr {
+  uint32_t magic;
+  uint32_t seq_num;
+  uint32_t tv_sec;
+  uint32_t tv_usec;
+};
+struct nw_hdr {
+  struct ether_header *ether;
+  struct iphdr *ip;
+  struct udphdr *udp;
+  struct pktgen_hdr *pktgen;
+};
+
+struct pkt_state {
+  uint32_t seq_num;
+  struct timeval rcv_ts, snd_ts;
+  uint32_t nw_dst;
+  TAILQ_ENTRY(pkt_state) entries;
+};
+TAILQ_HEAD(tailhead, pkt_state) head;
 
 struct test_cfg {
   uint32_t server_ip;
@@ -27,6 +53,7 @@ struct test_cfg {
   size_t pkt_out_OID_len;
 
   char *snmp_community;
+  netsnmp_session session;
   char *intf_name;
     
   char *pkt_output;
@@ -49,8 +76,6 @@ struct test_cfg {
 
 int my_read_objid(char *in_oid, oid *out_oid, size_t *out_oid_len);
 
-
-
 int 
 load_cfg(struct test_cfg *test_cfg, const char *config) {
   config_t conf;
@@ -63,7 +88,8 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
 
   config_init(&conf);
   if(config_read_file(&conf, config) == CONFIG_FALSE) {
-    fprintf(stderr, "failed %s:%d %s\n", config, config_error_line(&conf), config_error_text(&conf));
+    fprintf(stderr, "failed %s:%d %s\n", config, config_error_line(&conf), 
+	    config_error_text(&conf));
     return 0;
   }
 
@@ -116,9 +142,10 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
       exit(1);
     }
   }
-  elem = config_lookup(&conf, "switch_test_delay.community");
+  elem = config_lookup(&conf, "switch_test_delay.snmp_community");
   if(elem != NULL) {
     if((str_val = (char *)config_setting_get_string(elem)) != NULL) {
+      printf("community : %s\n", str_val);
       test_cfg->snmp_community = malloc(strlen(str_val) + 1);
       strcpy(test_cfg->snmp_community, str_val);
     } else {
@@ -233,6 +260,10 @@ curl_write_method(char *buffer, size_t size,
 }
 
 void
+destroy_cfg() {
+};
+
+void
 curl_write_destroy() {
   free(curl_buf);
   curl_buf=NULL;
@@ -320,7 +351,7 @@ install_flows() {
 int
 init_pcap() {
   char errbuf[PCAP_ERRBUF_SIZE];
-  obj_cfg.pcap = pcap_open_live(obj_cfg.intf_name, 100, 1, 0, errbuf);
+  obj_cfg.pcap = pcap_open_live(obj_cfg.intf_name, 70, 1, 0, errbuf);
   if(obj_cfg.pcap == NULL) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);
@@ -337,11 +368,131 @@ init_pcap() {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);    
   }
+
+  //init in memory packet storage
+  TAILQ_INIT(&head);     
 };
+
+int
+extract_headers(uint8_t *data, uint32_t data_len, struct nw_hdr *hdr) {
+  uint32_t pointer = 0;
+  
+  if(data_len < sizeof( struct ether_header))
+    return 0;
+  
+  // parse ethernet header
+  hdr->ether = (struct ether_header *) data;
+  pointer += sizeof( struct ether_header);
+  data_len -=  sizeof( struct ether_header);
+  
+  // parse ip header
+  if(data_len < sizeof(struct iphdr))
+    return 0;
+  hdr->ip = (struct iphdr *) (data + pointer);
+  if(data_len < hdr->ip->ihl*4) 
+    return 0;
+  pointer += hdr->ip->ihl*4;
+  data_len -= hdr->ip->ihl*4;
+  
+  //parse udp header
+  if(hdr->ip->protocol == IPPROTO_UDP) {
+    hdr->udp = (struct udphdr *)(data + pointer);
+    pointer += sizeof(struct udphdr);
+    hdr->pktgen = (struct pktgen_hdr *)(data + pointer);
+  } else {
+    return 0;
+  }
+  return 1;
+}
 
 void 
 process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
-  printf("processing pkt\n");
+  struct nw_hdr *hdr = (struct nw_hdr *)malloc(sizeof(struct nw_hdr));
+  char nw_src[20], nw_dst[20];
+  struct pkt_state *state;
+
+  bzero(hdr,sizeof(struct nw_hdr));
+  if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr)) {
+    state = malloc(sizeof(struct pkt_state));
+    bzero(state,sizeof(struct pkt_state));
+    /* printf("%ld.%06ld;%ld.%06ld;%ld;%s\n",   */
+    /* 	    (long int)pkt_header->ts.tv_sec,   */
+    /* 	    (long int)pkt_header->ts.tv_usec,  */
+    /* 	    (long int)ntohl(hdr->pktgen->tv_sec),   */
+    /* 	    (long int)ntohl(hdr->pktgen->tv_usec), */
+    /* 	    (long int) ntohl(hdr->pktgen->seq_num), */
+    /* 	    (char *)inet_ntoa(hdr->ip->daddr));   */
+
+    state->seq_num = ntohl(hdr->pktgen->seq_num);
+    state->rcv_ts.tv_sec = pkt_header->ts.tv_sec;
+    state->rcv_ts.tv_usec = pkt_header->ts.tv_usec;
+    state->snd_ts.tv_sec = ntohl(hdr->pktgen->tv_sec);
+    state->snd_ts.tv_usec = ntohl(hdr->pktgen->tv_usec);
+    state->nw_dst = hdr->ip->daddr;
+    /* printf("%ld.%06ld;%ld.%06ld;%ld;%s\n",   */
+    /* 	    (long int)state->rcv_ts.tv_sec,   */
+    /* 	    (long int)state->rcv_ts.tv_usec,  */
+    /* 	    (long int)state->snd_ts.tv_sec,   */
+    /* 	    (long int)state->snd_ts.tv_usec, */
+    /* 	    (long int)state->seq_num, */
+    /* 	    (char *)inet_ntoa(state->nw_dst));   */
+
+    TAILQ_INSERT_TAIL(&head, state, entries);
+  }
+}
+
+void
+get_snmp_status(struct timeval *ts) {
+  netsnmp_session *ss;    
+  netsnmp_pdu *pdu;
+  netsnmp_pdu *response;
+  int status, count;
+  netsnmp_variable_list *vars;
+
+  SOCK_STARTUP;
+  ss = snmp_open(&obj_cfg.session);       /* establish the session */
+  
+  if (!ss) {
+    snmp_sess_perror("ack", &obj_cfg.session);
+    SOCK_CLEANUP;
+    exit(1);
+  }
+
+  pdu = snmp_pdu_create(SNMP_MSG_GET);
+  snmp_add_null_var(pdu, obj_cfg.cpu_OID,  obj_cfg.cpu_OID_len);
+  snmp_add_null_var(pdu, obj_cfg.pkt_in_OID, obj_cfg.pkt_in_OID_len);
+  snmp_add_null_var(pdu, obj_cfg.pkt_out_OID, obj_cfg.pkt_out_OID_len);
+  
+  status = snmp_synch_response(ss, pdu, &response);
+  if (status == STAT_SUCCESS && response->errstat == SNMP_ERR_NOERROR) {    
+    /* manipuate the information ourselves */
+    for(vars = response->variables; vars; vars = vars->next_variable) {
+      if (vars->type == ASN_OCTET_STR) {
+	char *sp = (char *)malloc(1 + vars->val_len);
+	memcpy(sp, vars->val.string, vars->val_len);
+	sp[vars->val_len] = '\0';
+	fprintf(obj_cfg.snmp_file, "%ld.%06ld;cpu;1;%s\n", ts->tv_sec, ts->tv_usec,sp);
+	free(sp);
+      } else if ((vars->type == ASN_INTEGER)  || (vars->type == 0x41)) {
+	if( memcmp(vars->name, obj_cfg.pkt_in_OID, obj_cfg.pkt_in_OID_len*sizeof(int)) == 0) 
+	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_in;1;%ld\n", ts->tv_sec, ts->tv_usec, 
+		  *vars->val.integer);
+	
+	if( memcmp(vars->name, obj_cfg.pkt_out_OID, obj_cfg.pkt_out_OID_len*sizeof(int)) == 0) 
+	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_out;1;%ld\n", ts->tv_sec, ts->tv_usec, 
+		  *vars->val.integer);
+	
+      } else 
+	printf("Unkknown type ASN type : %x\n", vars->type);
+    }
+  } else {
+    printf("failed to get cpu value\n");
+  }
+
+  if (response)
+    snmp_free_pdu(response);
+  snmp_close(ss);
+  SOCK_CLEANUP;
 }
 
 void *
@@ -353,7 +504,8 @@ packet_capture( void *ptr ) {
   int ret;
 
   gettimeofday(&last_snmp, NULL);
-
+  get_snmp_status(&last_snmp);
+  
   while(!obj_cfg.finished) {       
     /* Initialize the file descriptor set. */
     FD_ZERO (&set);
@@ -369,15 +521,15 @@ packet_capture( void *ptr ) {
       timeout.tv_sec = 10 - now.tv_sec + last_snmp.tv_sec;
     }
       
-
-    if( timeout.tv_sec <= 0) {
+    if(( timeout.tv_sec <= 0) && (timeout.tv_usec <= 0)) {
       memcpy(&last_snmp, &now, sizeof(struct timeval));
-      printf("send snmp now:%ld\n", now.tv_sec, last_snmp.tv_sec);
+      get_snmp_status(&last_snmp);
+      //printf("send snmp now:%ld\n", now.tv_sec, last_snmp.tv_sec);
       timeout.tv_sec = 10;
       timeout.tv_usec = 0;
     }
 
-    printf(" %ld.%06ld: timed out at %ld.%06ld\n", now.tv_sec, now.tv_usec, timeout.tv_sec, timeout.tv_usec);
+    //printf(" %ld.%06ld: timed out at %ld.%06ld\n", now.tv_sec, now.tv_usec, timeout.tv_sec, timeout.tv_usec);
     if( (ret = select(FD_SETSIZE, &set, NULL, NULL, 
 		      &timeout)) < 0) {
       perror("capture select");
@@ -385,7 +537,8 @@ packet_capture( void *ptr ) {
     }
     if(ret == 0) {
       gettimeofday(&last_snmp, NULL);
-      printf("send snmp%ld\n", last_snmp.tv_sec);
+      get_snmp_status(&last_snmp);
+      printf("send snmp %ld\n", last_snmp.tv_sec);
     } else {
        /* Service all the sockets with input pending. */
       if (FD_ISSET(obj_cfg.pcap_fd, &set))  {
@@ -401,82 +554,125 @@ packet_capture( void *ptr ) {
   printf("this is the packet capturer\n");
 };
 
+
+int 
+printf_and_check(char *filename, char *msg) {
+  FILE *ctrl = fopen(filename, "w");
+  //printf("echo %s > %s\n", msg, filename);
+  if(ctrl == NULL) {
+    perror("failed to open file"); 
+    exit(1);
+  }
+
+  if (fprintf(ctrl, "%s\n", msg) < 0) {
+    perror("failed to write command");
+    exit(1);
+  }
+
+  fclose(ctrl);
+  return 1;
+}
+
 void *
 packet_generate( void *ptr ) {
   struct timeval start, now;
-  char intf_file[1024];
+  char intf_file[1024], msg[1024];
   FILE *file;
   struct in_addr addr;
 
-  //clean up any previous devices in the pktgen intf
-  if((file = fopen("/proc/net/pktgen/kpktgend_0", "w")) == NULL)  {
-    perror("fopen kpktgend_0");
-    exit(1);
-  }
-  fprintf(file, "rem_device_all\n");
-  fclose(file);
+  printf_and_check("/proc/net/pktgen/kpktgend_0",  "rem_device_all");
 
-  //add the device over which we send packets
-  //if((file = fopen("/proc/net/pktgen/kpktgend_0", "w")) == NULL)  {
-  if((file = fopen("kpktgend_0", "w")) == NULL)  {
-    perror("fopen kpktgend_0");
-    exit(1);
-  }
-  fprintf(file, "add_device %s\n", obj_cfg.intf_name);
-  fclose(file);
+  snprintf(msg, 1024, "add_device %s", obj_cfg.intf_name);
+  printf_and_check("/proc/net/pktgen/kpktgend_0",msg );
 
   snprintf(intf_file, 1024, "/proc/net/pktgen/%s",obj_cfg.intf_name);
-  snprintf(intf_file, 1024, "%s",obj_cfg.intf_name);
-  if((file = fopen(intf_file, "w")) == NULL)  {
-    perror("fopen intf_file");
+  printf_and_check(intf_file, "clone_skb 0");
+  uint32_t delay = (uint32_t)((8*obj_cfg.pkt_size*1000)/(obj_cfg.data_rate));
+  snprintf(msg, 1024, "delay %lu", (long unsigned int)delay);
+  printf("delay %lu\n", (long unsigned int)delay);
+  printf_and_check(intf_file, msg);
+  snprintf(msg, 1024, "count %lu", 
+	   (long unsigned int)(obj_cfg.duration*(1000000000/delay)));
+  printf("duration %d delay %d count %lu\n", obj_cfg.duration, delay,
+	 (long unsigned int)(obj_cfg.duration*(1000000000/delay)));
+  printf_and_check(intf_file, msg);
+  snprintf(msg, 1024, "pkt_size %d", obj_cfg.pkt_size);
+  printf_and_check(intf_file, msg);
+
+  if(strcmp(obj_cfg.flow_type, "wildcard") == 0) {
+    printf_and_check(intf_file,  "dst_min 10.3.1.0");
+    addr.s_addr = htonl(ntohl(inet_addr("10.3.1.0")) + ((obj_cfg.flow_num) << 8) - 1);
+  } else if (strcmp(obj_cfg.flow_type, "exact")== 0) {
+    printf_and_check(intf_file,  "dst_min 10.3.0.1");
+    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.1")) + (obj_cfg.flow_num));
+  } else  {
+    printf("Invalid flow type\n");
     exit(1);
   }
-  fprintf(file, "clone_skb 0\n");
-  uint32_t delay = (uint32_t)((obj_cfg.data_rate*1000000000)/(8*obj_cfg.pkt_size));
-  fprintf(file, "delay %lu\n", (long unsigned int)delay);
-  printf("delay %lu\n", (long unsigned int)delay);
-  fprintf(file, "count %lu\n", (long unsigned int)(obj_cfg.duration*1000000000/delay));
-  printf("count %lu\n", (long unsigned int)(obj_cfg.duration*1000000000/delay));
-  fprintf(file, "pkt_size %d\n", obj_cfg.pkt_size);
+  snprintf(msg, 1024, "dst_max %s", (char *)inet_ntoa(addr)); 
+  printf_and_check(intf_file, msg);
+  printf_and_check(intf_file,"flag IPDST_RND");
 
-  fprintf(file, "dst_min 10.3.0.1\n");
-  addr.s_addr = htonl(ntohl(inet_addr("10.3.0.1")) + obj_cfg.flow_num);
-  fprintf(file, "dst_max %s\n", (char *)inet_ntoa(addr)); 
-  fprintf(file, "flag IPDST_RND\n"); 
-
-  fprintf(file, "vlan_id 0xffff\n");
-  fprintf(file, "vlan_p 0\n"); 
-  fprintf(file, "vlan_cfi 0\n"); 
-  fprintf(file, "dst_mac 10:20:30:40:50:60\n");
-  fprintf(file, "src_mac 10:20:30:40:50:61\n");
-  fprintf(file, "src_min 10.2.0.1\n");
-  fprintf(file, "src_max 10.2.0.1\n");
-  fprintf(file, "tos 4\n");
-  fprintf(file, "udp_src_max 8080\n");
-  fprintf(file, "udp_src_min 8080\n");
-  fprintf(file, "udp_dst_max 8080\n");
-  fprintf(file, "udp_dst_min 8080\n");
-
-  fclose(file);
+  snprintf(msg, 1024, "vlan_id %ld", (long int)0xffff);
+  printf_and_check(intf_file, msg);
+  printf_and_check(intf_file, "vlan_p 0"); 
+  printf_and_check(intf_file, "vlan_cfi 0"); 
+  printf_and_check(intf_file, "dst_mac 10:20:30:40:50:60");
+  printf_and_check(intf_file, "src_mac 10:20:30:40:50:61");
+  printf_and_check(intf_file, "src_min 10.2.0.1");
+  printf_and_check(intf_file, "src_max 10.2.0.1");
+  printf_and_check(intf_file, "tos 0");
+  printf_and_check(intf_file, "udp_src_max 8080");
+  printf_and_check(intf_file, "udp_src_min 8080");
+  printf_and_check(intf_file, "udp_dst_max 8080");
+  printf_and_check(intf_file, "udp_dst_min 8080");
 
   //start packet generation
-  //  if((file = fopen("/proc/net/pktgen/pgctrl", "w")) == NULL)  {
-  if((file = fopen("pgctrl", "w")) == NULL)  {
-    perror("fopen pgctrl");
-    exit(1);
-  }
-  fprintf(file, "start\n");
-  fclose(file);
+  printf_and_check("/proc/net/pktgen/pgctrl", "start");
 
-  /* gettimeofday(&start, NULL); */
-  /* do { */
-  /*   pthread_yield(); */
-  /*   gettimeofday(&now, NULL); */
-  /* } while(now.tv_sec - start.tv_sec < 31); */
-
-    printf("this is the packet generator\n");
-    obj_cfg.finished = 1;
+  obj_cfg.finished = 1;
 };
+
+void
+process_data() {
+  struct pkt_state *state;
+  while (head.tqh_first != NULL) {
+    state = head.tqh_first;
+    fprintf(obj_cfg.pkt_file, "%ld.%06ld;%ld.%06ld;%ld;%s\n",  
+	    (long int)state->rcv_ts.tv_sec,  
+	    (long int)state->rcv_ts.tv_usec, 
+	    (long int)state->snd_ts.tv_sec,  
+	    (long int)state->snd_ts.tv_usec,
+	    (long int)state->seq_num,
+	    (char *)inet_ntoa(state->nw_dst));  
+    TAILQ_REMOVE(&head, head.tqh_first, entries);
+    free(state);
+  }
+  fclose(obj_cfg.pkt_file);
+};
+
+int 
+initialize_snmp() {
+  struct in_addr addr;
+  /*
+   * Initialize the SNMP library
+   */
+  init_snmp("switch_delay_test");
+
+  /*
+   * Initialize a "session" that defines who we're going to talk to
+   */
+  snmp_sess_init( &obj_cfg.session );                   /* set up defaults */
+  addr.s_addr = obj_cfg.server_ip;
+  obj_cfg.session.peername = strdup((char *)inet_ntoa(addr));
+    
+  /* set the SNMP version number */
+  obj_cfg.session.version = SNMP_VERSION_1;
+
+  /* set the SNMPv1 community name used for authentication */
+  obj_cfg.session.community = obj_cfg.snmp_community;
+  obj_cfg.session.community_len = strlen(obj_cfg.snmp_community);
+}
 
 int 
 main(int argc, char **argv) {
@@ -495,7 +691,9 @@ main(int argc, char **argv) {
     exit(1);
   }
 
+  initialize_snmp();
   init_pcap();
+  install_flows();
 
   if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) ||
       (pthread_create( &thrd_generate, NULL, packet_generate, NULL))) {
@@ -505,6 +703,9 @@ main(int argc, char **argv) {
 
   pthread_join(thrd_capture, NULL);
   pthread_join(thrd_generate, NULL); 
+
+  process_data();
+  destroy_cfg();
 
   exit(0);
 }
