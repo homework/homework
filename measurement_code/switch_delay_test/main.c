@@ -261,6 +261,19 @@ curl_write_method(char *buffer, size_t size,
 
 void
 destroy_cfg() {
+  struct pcap_stat ps;
+
+  fclose(obj_cfg.pkt_file);
+  fclose(obj_cfg.snmp_file);
+
+  //print pcap capture stats
+  if(pcap_stats(obj_cfg.pcap, &ps) < 0) {
+    printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.pcap));
+  } else {
+    printf("pcap stat : %u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+  }
+
+  pcap_close(obj_cfg.pcap);
 };
 
 void
@@ -521,7 +534,7 @@ packet_capture( void *ptr ) {
       timeout.tv_sec = 10 - now.tv_sec + last_snmp.tv_sec;
     }
       
-    if(( timeout.tv_sec <= 0) && (timeout.tv_usec <= 0)) {
+    if(( timeout.tv_sec <= 0)) {
       memcpy(&last_snmp, &now, sizeof(struct timeval));
       get_snmp_status(&last_snmp);
       //printf("send snmp now:%ld\n", now.tv_sec, last_snmp.tv_sec);
@@ -648,7 +661,7 @@ process_data() {
     TAILQ_REMOVE(&head, head.tqh_first, entries);
     free(state);
   }
-  fclose(obj_cfg.pkt_file);
+  //fclose(obj_cfg.pkt_file);
 };
 
 int 
