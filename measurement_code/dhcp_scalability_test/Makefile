@@ -3,7 +3,7 @@ all: switch_code_test
 switch_code_test: main.o
 	gcc -g `pkg-config --libs libconfig` `curl-config --libs` -lpcap \
 	-lsnmp -lpthread `pkg-config --libs gobject-2.0` `pkg-config --libs json-glib-1.0`\
-	-o network_stack_test main.o
+	-o dhcp_scalability_test main.o
 
 main.o: main.c
 	gcc -g `pkg-config --cflags libconfig` `curl-config --cflags` \

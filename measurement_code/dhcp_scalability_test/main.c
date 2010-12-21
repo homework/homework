@@ -9,6 +9,7 @@
 #include <sys/queue.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
+#include <string.h>
 
 #include <sys/socket.h>
 #include <linux/if_ether.h>
@@ -18,37 +19,28 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 
-#include <glib-object.h>
-#include <json-glib/json-glib.h>
-
 #include <net-snmp/net-snmp-config.h>
 #include <net-snmp/net-snmp-includes.h>
 
-#include <curl/curl.h>
-
 #include <libconfig.h>
+
+#include "dhcp.h"
 
 uint8_t pkt_buf[3000];
 uint32_t pkt_count = 0;
 
-struct pktgen_hdr {
-  uint32_t id;
-  uint32_t echo_snd_tv_sec;
-  uint32_t echo_snd_tv_usec;
-  uint32_t echo_rcv_tv_sec;
-  uint32_t echo_rcv_tv_usec;
-};
 struct nw_hdr {
   struct ether_header *ether;
   struct iphdr *ip;
   struct udphdr *udp;
-  struct pktgen_hdr *pktgen;
+  struct dhcp_packet *dhcp;
 };
 
 struct pkt_state {
-  uint32_t seq_num;
-  struct timeval data_rcv_ts, echo_snd_ts, data_snd_ts;
-  uint32_t nw_dst;
+  uint8_t addr[6];
+  struct timeval dhcp_offer_ts;
+  struct timeval dhcp_ack_ts;
+  int state;
   TAILQ_ENTRY(pkt_state) entries;
 };
 TAILQ_HEAD(tailhead, pkt_state) head;
@@ -67,16 +59,11 @@ struct test_cfg {
   netsnmp_session session;
 
   //device details
-  char *data_dev_name;
-  int data_dev_fd;
-  int data_dev_ix;
-  pcap_t *data_pcap;
-  int data_pcap_fd;
-  char *echo_dev_name;
-  int echo_dev_fd;
-  int echo_dev_ix;
-  pcap_t *echo_pcap;
-  int echo_pcap_fd;
+  char *dev_name;
+  int dev_fd;
+  int dev_ix;
+  pcap_t *pcap;
+  int pcap_fd;
     
   char *pkt_output;
   char *snmp_output;
@@ -85,18 +72,13 @@ struct test_cfg {
   FILE *snmp_file;
   
   int flow_num;
-  char *flow_type;
 
-  uint16_t pkt_size;
-  uint32_t duration;
   float data_rate; 
-  float probe_rate; 
   int finished;
 
 } obj_cfg;
 
 int my_read_objid(char *in_oid, oid *out_oid, size_t *out_oid_len);
-void generate_packet(int len);
 void send_data_raw_socket(int fd, int ix,  void *msg, int len);
 
 uint16_t Checksum(const uint16_t* buf, unsigned int nbytes) {
@@ -109,6 +91,24 @@ uint16_t Checksum(const uint16_t* buf, unsigned int nbytes) {
   sum += (sum >> 16);
   return ~sum;
 }
+
+
+void
+destroy_cfg() {
+  struct pcap_stat ps;
+
+  fclose(obj_cfg.pkt_file);
+  fclose(obj_cfg.snmp_file);
+
+  //print pcap capture stats
+  if(pcap_stats(obj_cfg.pcap, &ps) < 0) {
+    printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.pcap));
+  } else {
+    printf("pcap stat : %u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+  }
+
+  pcap_close(obj_cfg.pcap);
+};
 
 int 
 load_cfg(struct test_cfg *test_cfg, const char *config) {
@@ -183,21 +183,10 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
   elem = config_lookup(&conf, "switch_test_delay.data_dev");
   if(elem != NULL) {
     if((str_val = (char *)config_setting_get_string(elem)) != NULL) {
-      test_cfg->data_dev_name = malloc(strlen(str_val) + 1);
-      strcpy(test_cfg->data_dev_name, str_val);
+      test_cfg->dev_name = malloc(strlen(str_val) + 1);
+      strcpy(test_cfg->dev_name, str_val);
     } else {
       printf("Failed to read data interface\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.echo_dev");
-  if(elem != NULL) {
-    if((str_val = (char *)config_setting_get_string(elem)) != NULL) {
-      test_cfg->echo_dev_name = malloc(strlen(str_val) + 1);
-      strcpy(test_cfg->echo_dev_name, str_val);
-    } else {
-      printf("Failed to read echo interface\n");
       exit(1);
     }
   }
@@ -228,48 +217,6 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
     }
   }
 
-  elem = config_lookup(&conf, "switch_test_delay.flow_type");
-  if(elem != NULL) {
-    if((str_val = (char *)config_setting_get_string(elem)) != 0) {
-      test_cfg->flow_type = malloc(strlen(str_val) + 1);
-      strcpy(test_cfg->flow_type, str_val);
-    } else {
-      printf("Failed to read flow_type\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.pkt_size");
-  if(elem != NULL) {
-    if((test_cfg->pkt_size = config_setting_get_int(elem)) == 0) {
-      printf("Failed to read pkt_size\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.duration");
-  if(elem != NULL) {
-    if((test_cfg->duration = config_setting_get_int(elem)) == 0) {
-      printf("Failed to read duration\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.data_rate");
-  if(elem != NULL) {
-    if((test_cfg->data_rate = config_setting_get_int(elem)) == 0) {
-      printf("Failed to read data_rate\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.probe_rate");
-  if(elem != NULL) {
-    if((test_cfg->probe_rate = config_setting_get_int(elem)) == 0) {
-      printf("Failed to read data_rate\n");
-      exit(1);
-    }
-  }
   config_destroy(&conf); 
   return 1;
   
@@ -280,167 +227,36 @@ usage() {
   printf("./test_switch_delay configuration.cfg\n");
 }
 
-char *curl_buf;
-uint32_t curl_buf_len;
-void
-curl_write_init() {
-  curl_buf=NULL;
-  curl_buf_len = 0;
-}
-
-/* curl calls this routine to get more data */ 
-static size_t 
-curl_write_method(char *buffer, size_t size,
-	       size_t nitems, void *userp) {
-    curl_buf = realloc(curl_buf, curl_buf_len + nitems*size + 1);
-    if(curl_buf == NULL) {
-      perror("curl_write_callback realloc");
-      exit(1);
-    }
-    memcpy(curl_buf + curl_buf_len, buffer, nitems*size);
-    curl_buf[curl_buf_len + nitems*size] = '\0';
-    curl_buf_len += nitems*size;
-  
-    return (nitems*size);
-}
-
-void
-destroy_cfg() {
-  struct pcap_stat ps;
-
-  fclose(obj_cfg.pkt_file);
-  fclose(obj_cfg.snmp_file);
-
-  //print pcap capture stats
-  if(pcap_stats(obj_cfg.data_pcap, &ps) < 0) {
-    printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.data_pcap));
-  } else {
-    printf("pcap stat : %u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
-  }
-
-  pcap_close(obj_cfg.data_pcap);
-};
-
-void
-curl_write_destroy() {
-  free(curl_buf);
-  curl_buf=NULL;
-  curl_buf_len = 0;
-}
-
-int
-install_flows() {
-  char msg[1024];
-  struct in_addr addr;
-
-  CURL *curl;
-  CURLcode res;
-  
-  JsonParser *parser;
-  JsonNode *root;
-  GError *error;
-  uint32_t success = 0;
-  
-  // using the more generic 
-  curl = curl_easy_init();
-  
-  //json parser
-  g_type_init ();
-  parser = json_parser_new ();
-  
-  if(curl) {
-    //init lib curl obj
-    curl_write_init();
-    
-    //set url
-    addr.s_addr = obj_cfg.server_ip;
-    snprintf(msg, 1024, "https://%s/ws.v1/network_stack_test/installflows/%d", (char *)inet_ntoa(addr), 
-	     obj_cfg.flow_num);
-    curl_easy_setopt(curl, CURLOPT_URL, msg);
-    
-    // this is an http get request
-    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-    
-    //don't get in trouble verifying the ssl credentials
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    
-    //when you receive data push them to the buffering function
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_method);
-    
-    do {
-      //get the data from the web service 
-      res = curl_easy_perform(curl);
-      if(res != CURLE_OK) {
-	printf("curl error: %s\n", curl_easy_strerror(res));
-	exit(1);
-      }
-
-      //load json data to a json parser
-      error = NULL;
-      json_parser_load_from_data(parser, curl_buf, curl_buf_len, &error);
-      if (error) {
-	g_print ("Unable to parse %s: %s\n",  curl_buf, error->message);
-	exit(1);
-      }
-
-      root = json_parser_get_root(parser);
-      if(root == NULL) {
-	printf("not exactly what I want\n");
-	exit(1);
-      } 
-      JsonReader *reader = json_reader_new(root);
-
-      json_reader_read_member (reader, "result");
-      success = json_reader_get_int_value (reader);  
-      json_reader_end_element (reader);
-      printf("result:%d\n", success);
-
-      curl_write_destroy();
-      
-      if(!success) sleep(3);
-    } while(!success);  
-    
-    /* always cleanup */ 
-    curl_easy_cleanup(curl);
-  }
-}
-
 int
 init_pcap() {
   char errbuf[PCAP_ERRBUF_SIZE];
-  obj_cfg.data_pcap = pcap_open_live(obj_cfg.data_dev_name, 70, 1, 0, errbuf);
-  if(obj_cfg.data_pcap == NULL) {
+  struct bpf_program fp;
+
+  obj_cfg.pcap = pcap_open_live(obj_cfg.dev_name, 70, 1, 0, errbuf);
+  if(obj_cfg.pcap == NULL) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);
-  }
-  
-  obj_cfg.data_pcap_fd = pcap_fileno(obj_cfg.data_pcap);
-  if(obj_cfg.data_pcap_fd < 0) {
-    printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.data_pcap));
-    exit(1);
-  } 
-  
-  //set pcap fd in non blocking, so that I can select on it. 
-  if(pcap_setnonblock(obj_cfg.data_pcap, 0, errbuf) < -1) {
-    printf("pcap_open_live:%s\n", errbuf);
-    exit(1);    
   }
 
-  obj_cfg.echo_pcap = pcap_open_live(obj_cfg.echo_dev_name, 70, 1, 0, errbuf);
-  if(obj_cfg.echo_pcap == NULL) {
-    printf("pcap_open_live:%s\n", errbuf);
-    exit(1);
+  //compile filter
+  if(pcap_compile(obj_cfg.pcap, &fp, "udp and dst port 68", 1, 0) < 0) {
+    printf("pcap_compile:%s\n", pcap_geterr(obj_cfg.pcap));
+    exit(1);  
+  }
+
+  if( pcap_setfilter(obj_cfg.pcap, &fp) < 0) {
+    printf("pcap_setfilter:%s\n", pcap_geterr(obj_cfg.pcap));
+    exit(1);  
   }
   
-  obj_cfg.echo_pcap_fd = pcap_fileno(obj_cfg.echo_pcap);
-  if(obj_cfg.echo_pcap_fd < 0) {
-    printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.echo_pcap));
+  obj_cfg.pcap_fd = pcap_fileno(obj_cfg.pcap);
+  if(obj_cfg.pcap_fd < 0) {
+    printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.pcap));
     exit(1);
   } 
   
   //set pcap fd in non blocking, so that I can select on it. 
-  if(pcap_setnonblock(obj_cfg.echo_pcap, 0, errbuf) < -1) {
+  if(pcap_setnonblock(obj_cfg.pcap, 0, errbuf) < -1) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);    
   }
@@ -474,11 +290,21 @@ extract_headers(uint8_t *data, uint32_t data_len, struct nw_hdr *hdr) {
   if(hdr->ip->protocol == IPPROTO_UDP) {
     hdr->udp = (struct udphdr *)(data + pointer);
     pointer += sizeof(struct udphdr);
-    hdr->pktgen = (struct pktgen_hdr *)(data + pointer);
+    //TODO: check here details 
+
+    hdr->dhcp = (struct dhcp_packet *)(data + pointer);
   } else {
     return 0;
   }
   return 1;
+}
+
+struct pkt_state *
+get_state(uint8_t mac_addr) {
+  struct pkt_state *np;
+  for (np = head.tqh_first; np != NULL; np = np->entries.tqe_next) 
+    if(memcmp(np->addr, mac_addr, 6) == 0) break;
+  return np;
 }
 
 void 
@@ -486,19 +312,48 @@ process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   struct nw_hdr *hdr = (struct nw_hdr *)malloc(sizeof(struct nw_hdr));
   char nw_src[20], nw_dst[20];
   struct pkt_state *state;
+
+  printf("received reply\n");
+
   bzero(hdr,sizeof(struct nw_hdr));
   if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr)) {
-    state = malloc(sizeof(struct pkt_state));
-    bzero(state,sizeof(struct pkt_state));
-    state->seq_num = ntohl(hdr->pktgen->id);
-    state->data_rcv_ts.tv_sec = pkt_header->ts.tv_sec;
-    state->data_rcv_ts.tv_usec = pkt_header->ts.tv_usec;
-    state->data_snd_ts.tv_sec = ntohl(hdr->pktgen->echo_snd_tv_sec);
-    state->data_snd_ts.tv_usec = ntohl(hdr->pktgen->echo_snd_tv_usec);
-    state->echo_snd_ts.tv_sec = ntohl(hdr->pktgen->echo_rcv_tv_sec);
-    state->echo_snd_ts.tv_usec = ntohl(hdr->pktgen->echo_rcv_tv_usec);
-    state->nw_dst = hdr->ip->daddr;
-    TAILQ_INSERT_TAIL(&head, state, entries);
+
+    if( (state = get_state(hdr->ether->ether_dhost)) == NULL ) {
+      state = malloc(sizeof(struct pkt_state));
+      bzero(state,sizeof(struct pkt_state));
+      memcpy(state->addr, hdr->ether->ether_dhost, 6);
+    }
+
+    //parse options
+    uint8_t *data = hdr->dhcp + sizeof(struct dhcp_packet);
+    uint16_t len = pkt_header->caplen - 
+      (((int)hdr->dhcp - (int)pkt_data) + sizeof(struct dhcp_packet));
+
+    //get the exact message type of the dhcp request
+    uint8_t dhcp_msg_type = 0;
+    while(len > 2) {
+      uint8_t dhcp_option = data[0];
+      uint8_t dhcp_option_len = data[1];
+      
+      printf("pos %d len %d type %d\n", data, dhcp_option_len, dhcp_option);
+
+      if(dhcp_option == 0xff) {
+      	//printf("Got end of options!!!!\n");
+     	break;
+      } else if(dhcp_option == 53) {
+	dhcp_msg_type = data[2];
+	if((dhcp_msg_type <1) || (dhcp_msg_type > 8)) {
+	  printf("Invalid DHCP Message Type : %d\n", dhcp_msg_type);
+	  return;
+	} 
+      }
+    
+      len -= (2 + dhcp_option_len );
+      data += (2 + dhcp_option_len );
+    }
+    printf("dhcp type : %d, offered ip : %lx\n",  
+	   dhcp_msg_type, hdr->dhcp->yiaddr);
+
   }
 }
 
@@ -547,11 +402,11 @@ generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   udp->dest = tmp_port;
 
   //append timestamp
-  printf("packet received pkt %ld\n",(long int) ntohl(pktgen->id));
-  pktgen->echo_rcv_tv_sec = htonl(pkt_header->ts.tv_sec);
-  pktgen->echo_rcv_tv_usec = htonl(pkt_header->ts.tv_usec);
+  /* printf("packet received pkt %ld\n",(long int) ntohl(pktgen->id)); */
+  /* pktgen->echo_rcv_tv_sec = htonl(pkt_header->ts.tv_sec); */
+  /* pktgen->echo_rcv_tv_usec = htonl(pkt_header->ts.tv_usec); */
   
-  send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
+  //send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
 }
 
 void
@@ -608,6 +463,112 @@ get_snmp_status(struct timeval *ts) {
   SOCK_CLEANUP;
 }
 
+void 
+send_dhcp_discovery(uint8_t *mac_addr, uint32_t xid, uint8_t dhcp_msg_type,
+		    char *hostname, uint32_t request_ip, uint32_t server_ip) {
+  int len;
+  
+  //message_type + netmask + router + nameserver + lease_time + end option
+  //lease time is seconds since it will timeout
+  
+    //setting up ethernet header details
+  struct ether_header *ether = (struct ether_header *) pkt_buf;
+  ether->ether_type = htons(ETHERTYPE_IP);
+  memcpy(ether->ether_dhost, "\xFF\xFF\xFF\xFF\xFF\xFF", ETH_ALEN);
+  memcpy(ether->ether_shost,  (const uint8_t *)mac_addr, ETH_ALEN);
+ 
+  //setting up ip header details   
+  struct iphdr *ip = (struct iphdr *) (pkt_buf + sizeof(struct ether_header));
+  ip->ihl = 5;
+  ip->version = 4;
+  ip->tos = 0; 
+  ip->id = 0;
+  ip->frag_off = 0;
+  ip->ttl = 0x80;
+  ip->protocol = 0x11;
+  ip->saddr =  0; 
+  ip->daddr =  inet_addr("255.255.255.255");
+  
+  //setting up udp header details   
+  struct udphdr *udp = (struct udphdr *)( pkt_buf + sizeof(struct ether_header) + 
+					  sizeof(struct iphdr));
+  udp->source = htons(68);
+  udp->dest = htons(67);
+  udp->check = 0x0;
+  
+  struct dhcp_packet  *reply = 
+    (struct dhcp_packet *)(pkt_buf + sizeof(struct ether_header) + 
+			   sizeof(struct iphdr) + sizeof(struct udphdr));
+  reply->op = BOOTREQUEST;
+  reply->htype = 0x01;
+  reply->hlen = 0x6;
+  reply->xid = xid;
+  reply->yiaddr = 0;
+  reply->siaddr =  0;
+  memcpy(reply->chaddr, mac_addr, 6);
+  reply->cookie =  0x63538263;//DHCP_OPTIONS_COOKIE;
+
+    //setting up options
+  uint8_t *options = (uint8_t *)(pkt_buf + sizeof(struct ether_header) + 
+				 sizeof(struct iphdr) +sizeof(struct udphdr) + 
+				 sizeof(struct dhcp_packet));
+  
+  len =  sizeof( struct ether_header) + sizeof(struct iphdr) + 
+    sizeof(struct udphdr) + sizeof(struct dhcp_packet);
+  
+  //setting up dhcp msg type
+  options[0] = 53;
+  options[1] = 1;
+  options[2] = dhcp_msg_type;
+  options += 3;
+  len += 3;
+  
+  if(server_ip != 0) {
+    //router 
+    options[0] = 54;
+    options[1] = 4;
+    *((uint32_t *)(options + 2)) = htonl(server_ip); 
+    options += 6;    
+    len += 6;    
+  }
+  
+  if(request_ip != 0) {
+    //selected host ip
+    options[0] = 50;
+    options[1] = 4;
+    *((uint32_t *)(options + 2)) = htonl(request_ip); 
+    options += 6;    
+    len += 6;    
+  }
+  
+  //hostname
+  options[0] =12;
+  options[1] = strlen(hostname);
+  memcpy(options + 2, hostname, strlen(hostname));
+  options += (2 + strlen(hostname));
+  len += (2 + strlen(hostname));
+  
+  options[0] = 0xff; 
+  len++;
+  
+  ip->tot_len = htons(len - sizeof(struct ether_header));
+  ip->check = Checksum(ip, 20);
+  udp->len = htons(len - sizeof(struct ether_header) - sizeof(struct iphdr));
+  
+  send_data_raw_socket(obj_cfg.dev_fd, obj_cfg.dev_ix, pkt_buf, len);
+}
+
+void *
+dhcp_discovery_thread( void *ptr ) {
+  uint8_t mac_addr[] = {0x08, 0x00, 0x27, 0xee, 0x1d, 0x00};
+  int32_t i;
+  
+  for( i = 0; i < obj_cfg.flow_num;i++) {
+    mac_addr[5] = i;
+    send_dhcp_discovery(mac_addr, 0x223311,  DHCPDISCOVER, "hello", 0 ,0 );
+  }
+}
+
 void *
 packet_capture( void *ptr ) {
   fd_set set;
@@ -622,8 +583,8 @@ packet_capture( void *ptr ) {
   while(!obj_cfg.finished) {       
     /* Initialize the file descriptor set. */
     FD_ZERO (&set);
-    FD_SET(obj_cfg.data_pcap_fd, &set);
-    FD_SET(obj_cfg.echo_pcap_fd, &set);
+    FD_SET(obj_cfg.pcap_fd, &set);
+    //FD_SET(obj_cfg.echo_pcap_fd, &set);
     gettimeofday(&now, NULL);
 
     /* Initialize the timeout data structure. */
@@ -655,20 +616,13 @@ packet_capture( void *ptr ) {
       printf("send snmp %ld\n", last_snmp.tv_sec);
     } else {
        /* Service all the sockets with input pending. */
-      if (FD_ISSET(obj_cfg.data_pcap_fd, &set))  {
-	if(pcap_next_ex(obj_cfg.data_pcap, &pkt_header,
+      if (FD_ISSET(obj_cfg.pcap_fd, &set))  {
+	if(pcap_next_ex(obj_cfg.pcap, &pkt_header,
 			&pkt_data) < 0) {
 	  perror("pcap_next_en");
 	  exit(1);
 	}
 	process_pcap_pkt(pkt_data, pkt_header);
-      } else if (FD_ISSET(obj_cfg.echo_pcap_fd, &set))  {
-	if(pcap_next_ex(obj_cfg.echo_pcap, &pkt_header,
-			&pkt_data) < 0) {
-	  perror("pcap_generate_reply");
-	  exit(1);
-	}
-	generate_reply(pkt_data, pkt_header);
       }
     }
   };
@@ -679,41 +633,6 @@ uint32_t
 timediff(struct timeval *now, struct timeval *last_pkt) {
   return (now->tv_sec - last_pkt->tv_sec) * 1000000 +
     (now->tv_usec - last_pkt->tv_usec);
-}
-
-void *
-echo_generate( void *ptr ) {
-  char intf_file[1024], msg[1024];
-  FILE *file;
-  int i;
-  struct timeval now, last_pkt, start;
-  uint32_t delay; //time between consecutive pkts in microsec
-
-  gettimeofday(&start, NULL);
-  gettimeofday(&last_pkt, NULL);
-  
-  delay = (uint32_t)((8*obj_cfg.pkt_size*1000)/(obj_cfg.data_rate));
-
-  while (1) {
-    pthread_yield();
-    gettimeofday(&now, NULL);    
-    if(timediff(&now, &last_pkt) >= delay ) {
-      /* printf("delay : %ld, now : %ld.%06ld, last : %ld.%06ld diff %ld\n", delay, now.tv_sec, now.tv_usec,  */
-      /* 	     last_pkt.tv_sec, last_pkt.tv_usec, timediff(&now, &last_pkt)); */
-      generate_packet(obj_cfg.pkt_size);
-      last_pkt.tv_usec += delay%1000000;
-      if(last_pkt.tv_usec >= 1000000) {
-	last_pkt.tv_usec -= 1000000;
-	last_pkt.tv_sec++;
-      }
-      last_pkt.tv_sec += (uint32_t)(delay/1000000);
-    } else if (timediff(&now, &start) >= obj_cfg.duration*1000000) {
-      break;
-    }
-  }
-
-  obj_cfg.finished = 1;
-  return;
 }
 
 int 
@@ -734,78 +653,19 @@ printf_and_check(char *filename, char *msg) {
   return 1;
 }
 
-void *
-data_generate( void *ptr ) {
-  char intf_file[1024], msg[1024];
-  FILE *file;
-  struct in_addr addr;
-
-  printf_and_check("/proc/net/pktgen/kpktgend_0",  "rem_device_all");
-
-  snprintf(msg, 1024, "add_device %s", obj_cfg.data_dev_name);
-  printf_and_check("/proc/net/pktgen/kpktgend_0",msg );
-
-  snprintf(intf_file, 1024, "/proc/net/pktgen/%s",obj_cfg.data_dev_name);
-  printf_and_check(intf_file, "clone_skb 0");
-  uint32_t delay = (uint32_t)((8*obj_cfg.pkt_size*1000)/(obj_cfg.data_rate));
-  snprintf(msg, 1024, "delay %lu", (long unsigned int)delay);
-  printf("delay %lu\n", (long unsigned int)delay);
-  printf_and_check(intf_file, msg);
-  snprintf(msg, 1024, "count %lu", 
-	   (long unsigned int)(obj_cfg.duration*(1000000000/delay)));
-  printf("duration %d delay %d count %lu\n", obj_cfg.duration, delay,
-	 (long unsigned int)(obj_cfg.duration*(1000000000/delay)));
-  printf_and_check(intf_file, msg);
-  snprintf(msg, 1024, "pkt_size %d", obj_cfg.pkt_size);
-  printf_and_check(intf_file, msg);
-
-  if(strcmp(obj_cfg.flow_type, "wildcard") == 0) {
-    printf_and_check(intf_file,  "dst_min 10.3.1.0");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.1.0")) + ((obj_cfg.flow_num) << 8) - 1);
-  } else if (strcmp(obj_cfg.flow_type, "exact")== 0) {
-    printf_and_check(intf_file,  "dst_min 10.3.0.1");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.1")) + (obj_cfg.flow_num));
-  } else  {
-    printf("Invalid flow type\n");
-    exit(1);
-  }
-  snprintf(msg, 1024, "dst_max %s", (char *)inet_ntoa(addr)); 
-  printf_and_check(intf_file, msg);
-  printf_and_check(intf_file,"flag IPDST_RND");
-
-  snprintf(msg, 1024, "vlan_id %ld", (long int)0xffff);
-  printf_and_check(intf_file, msg);
-  printf_and_check(intf_file, "vlan_p 0"); 
-  printf_and_check(intf_file, "vlan_cfi 0"); 
-  printf_and_check(intf_file, "dst_mac 10:20:30:40:50:60");
-  printf_and_check(intf_file, "src_mac 10:20:30:40:50:61");
-  printf_and_check(intf_file, "src_min 10.2.0.1");
-  printf_and_check(intf_file, "src_max 10.2.0.1");
-  printf_and_check(intf_file, "tos 0");
-  printf_and_check(intf_file, "udp_src_max 8080");
-  printf_and_check(intf_file, "udp_src_min 8080");
-  printf_and_check(intf_file, "udp_dst_max 8080");
-  printf_and_check(intf_file, "udp_dst_min 8080");
-
-  //start packet generation
-  printf_and_check("/proc/net/pktgen/pgctrl", "start");
-
-  obj_cfg.finished = 1;
-};
-
 void
 process_data() {
   struct pkt_state *state;
   while (head.tqh_first != NULL) {
     state = head.tqh_first;
-    fprintf(obj_cfg.pkt_file, "%ld.%06ld;%ld.%06ld;%ld;%s\n",  
-	    (long int)state->data_rcv_ts.tv_sec,  
-	    (long int)state->data_rcv_ts.tv_usec, 
-	    (long int)state->data_snd_ts.tv_sec,  
-	    (long int)state->data_snd_ts.tv_usec,
-	    (long int)state->seq_num,
-	    (char *)inet_ntoa(state->nw_dst));  
-    TAILQ_REMOVE(&head, head.tqh_first, entries);
+    /* fprintf(obj_cfg.pkt_file, "%ld.%06ld;%ld.%06ld;%ld;%s\n",   */
+    /* 	    (long int)state->data_rcv_ts.tv_sec,   */
+    /* 	    (long int)state->data_rcv_ts.tv_usec,  */
+    /* 	    (long int)state->data_snd_ts.tv_sec,   */
+    /* 	    (long int)state->data_snd_ts.tv_usec, */
+    /* 	    (long int)state->seq_num, */
+    /* 	    (char *)inet_ntoa(state->nw_dst));   */
+    /* TAILQ_REMOVE(&head, head.tqh_first, entrie s);*/
     free(state);
   }
   //fclose(obj_cfg.pkt_file);
@@ -832,54 +692,6 @@ initialize_snmp() {
   /* set the SNMPv1 community name used for authentication */
   obj_cfg.session.community = obj_cfg.snmp_community;
   obj_cfg.session.community_len = strlen(obj_cfg.snmp_community);
-}
-
-uint16_t id=0x1140;
-
-void 
-generate_packet(int len) {
-  struct ether_header *ether;
-  struct iphdr *ip;
-  struct udphdr *udp;
-  struct pktgen_hdr *pktgen;
-  struct timeval now;
-
-  uint32_t src_ip = ntohl(inet_addr("10.2.0.0")) + ((rand()%(obj_cfg.flow_num + 1)) << 2) + 2;
-  uint32_t dst_ip = ntohl(inet_addr("10.3.0.0")) + (rand()%65533) + 4;
-
-  ether = (struct ether_header *)pkt_buf;
-  memcpy(ether->ether_shost, "\x08\x00\x27\x62\x1c\x95" /*"\x08\x00\x27\x89\x68\xfa"*/, ETH_ALEN); 
-  memcpy(ether->ether_dhost, "\x08\x00\x27\x33\x3a\x38" /*"\x08\x00\x27\x75\xff\x61"*/, ETH_ALEN); 
-  ether->ether_type = htons(ETHERTYPE_IP);
-
-  ip = (struct iphdr *)(pkt_buf + ETHER_HDR_LEN);
-  bzero(ip, sizeof(struct iphdr));
-  ip->ihl = 5;
-  ip->version = 4;
-  ip->ttl = 0x40;
-  //  ip->id = htons(id++);
-  ip->protocol = IPPROTO_UDP;
-  ip->tot_len = htons(len - ETHER_HDR_LEN );
-  ip->saddr = htonl(src_ip);
-  ip->daddr = htonl(dst_ip);
-  ip->check =  Checksum((uint16_t *)ip, 20);
-  
-  udp = (struct udphdr *)(pkt_buf + ETHER_HDR_LEN + sizeof(struct iphdr));
-  udp->source = htons(41215);
-  udp->dest =  htons(53);
-  udp->len = htons(len -  ETHER_HDR_LEN - sizeof(struct iphdr));
-  udp->check = 0; //htons(0x4a77);
-
-  pktgen = (struct pktgen_hdr *)(pkt_buf + ETHER_HDR_LEN + sizeof(struct iphdr) 
-			     + sizeof(struct udphdr));
-  pktgen->id = htonl(++pkt_count);
-  gettimeofday(&now, NULL);
-  pktgen->echo_snd_tv_sec = htonl(now.tv_sec);
-  pktgen->echo_snd_tv_usec = htonl(now.tv_usec);
-  
-  printf("seding packet %d\n", pkt_count);
-
-  send_data_raw_socket(obj_cfg.data_dev_fd, obj_cfg.data_dev_ix, pkt_buf, len);
 }
 
 void 
@@ -910,49 +722,28 @@ initialize_raw_socket() {
   struct sockaddr_ll saddrll;
   struct channel_info * ch_info;
   
-  obj_cfg.data_dev_fd = socket(AF_PACKET,SOCK_RAW, htons(ETH_P_ALL));
-  if( obj_cfg.data_dev_fd == -1) {
+  obj_cfg.dev_fd = socket(AF_PACKET,SOCK_RAW, htons(ETH_P_ALL));
+  if( obj_cfg.dev_fd == -1) {
     perror("raw socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))");
     exit(1);
   }
   
   // bind to a specific port
-  strncpy(ifr.ifr_name, obj_cfg.data_dev_name,IFNAMSIZ);
-  if( ioctl(obj_cfg.data_dev_fd, SIOCGIFINDEX, &ifr)  == -1 ) {
+  strncpy(ifr.ifr_name, obj_cfg.dev_name,IFNAMSIZ);
+  if( ioctl(obj_cfg.dev_fd, SIOCGIFINDEX, &ifr)  == -1 ) {
     perror("ioctl()");
     exit(1);
   }
-  obj_cfg.data_dev_ix = ifr.ifr_ifindex;
+  obj_cfg.dev_ix = ifr.ifr_ifindex;
   memset(&saddrll, 0, sizeof(saddrll));
   saddrll.sll_family = AF_PACKET;
   saddrll.sll_protocol = ETH_P_ALL;
   saddrll.sll_ifindex = ifr.ifr_ifindex;
-  if ( bind(obj_cfg.data_dev_fd, (struct sockaddr *) &saddrll, sizeof(struct sockaddr_ll)) == -1 ) {
+  if ( bind(obj_cfg.dev_fd, (struct sockaddr *) &saddrll, sizeof(struct sockaddr_ll)) == -1 ) {
     perror("bind()");
     exit(1);
   }
 
-  obj_cfg.echo_dev_fd = socket(AF_PACKET,SOCK_RAW, htons(ETH_P_ALL));
-  if( obj_cfg.echo_dev_fd == -1) {
-    perror("raw socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))");
-    exit(1);
-  }
-  
-  // bind to a specific port
-  strncpy(ifr.ifr_name, obj_cfg.echo_dev_name,IFNAMSIZ);
-  if( ioctl(obj_cfg.echo_dev_fd, SIOCGIFINDEX, &ifr)  == -1 ) {
-    perror("ioctl()");
-    exit(1);
-  }
-  obj_cfg.echo_dev_ix = ifr.ifr_ifindex;
-  memset(&saddrll, 0, sizeof(saddrll));
-  saddrll.sll_family = AF_PACKET;
-  saddrll.sll_protocol = ETH_P_ALL;
-  saddrll.sll_ifindex = ifr.ifr_ifindex;
-  if ( bind(obj_cfg.echo_dev_fd, (struct sockaddr *) &saddrll, sizeof(struct sockaddr_ll)) == -1 ) {
-    perror("bind()");
-    exit(1);
-  }
 }
 
 int 
@@ -975,19 +766,18 @@ main(int argc, char **argv) {
   initialize_snmp();
   initialize_raw_socket();
   init_pcap();
-  install_flows();
 
   if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) 
-      || (pthread_create( &thrd_echo, NULL, echo_generate, NULL)) 
-      || (pthread_create( &thrd_data, NULL, data_generate, NULL)) 
+      || (pthread_create( &thrd_echo, NULL, dhcp_discovery_thread, NULL)) 
+      //      || (pthread_create( &thrd_data, NULL, data_generate, NULL)) 
       ) {
     perror("pthread_create");
     exit(1);
   }
 
-  pthread_join(thrd_capture, NULL);
-  pthread_join(thrd_echo, NULL); 
-  pthread_join(thrd_data, NULL); 
+  pthread_join(thrd_echo, NULL);
+  pthread_join(thrd_capture, NULL); 
+  //  pthread_join(thrd_data, NULL); 
 
   process_data();
   destroy_cfg();
