@@ -18,6 +18,21 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 
+#include <linux/netlink.h> 
+#include <netlink/object-api.h>
+#include <linux/pkt_sched.h>
+struct ucred
+{
+  pid_t pid;			/* PID of sending process.  */
+  uid_t uid;			/* UID of sending process.  */
+  gid_t gid;			/* GID of sending process.  */
+};
+#include <netlink-types.h> 
+#include <netlink/addr.h>
+#include <netlink/socket.h>
+#include <netlink/route/link.h> 
+#include <netlink/route/addr.h> 
+
 #include <glib-object.h>
 #include <json-glib/json-glib.h>
 
@@ -408,8 +423,89 @@ install_flows() {
 
 int
 init_pcap() {
+  struct nl_cache *cache;
+  //unsigned char mac_addr[ETH_ALEN];
+  struct ifreq ifr;
+  int s;
+  struct nl_sock *sk;        //the socket to talk to netlink
+  int ifindex;
+  struct rtnl_addr *addr;
+  struct nl_addr *local_addr;
+  uint32_t ip, i;
+  struct bpf_program fp;
+
+  //setup multiple ips on device data_dev_name
+  //initialiaze and connect the socket to the netlink socket
+  if((sk = nl_socket_alloc()) == NULL) {
+    perror("socket alloc");
+    exit(1);
+  }
+  if(nl_connect(sk, NETLINK_ROUTE) != 0) {
+    perror("nl connect");
+    exit(1);
+  }
+  
+  //looking the index of the bridge  
+  if ( (rtnl_link_alloc_cache(sk, &cache) ) != 0) {
+    perror("link alloc cache");
+    exit(1);
+  }
+  
+  if ( ( ifindex = rtnl_link_name2i(cache,  obj_cfg.data_dev_name) ) == 0) {
+    perror("Failed to translate interface name to int");
+    exit(1);
+  }
+  printf("Retrieving ix %d for intf %s\n", ifindex, obj_cfg.data_dev_name);
+  
+  s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s==-1) {
+    perror("Failed to open socket");
+    exit(1);
+  }
+  
+  ip = inet_addr("10.2.0.2");
+  for (i = 0; i < obj_cfg.flow_num; i++) {
+    // Allocate an empty address object to be filled out with the attributes
+    // of the new address.
+    addr = rtnl_addr_alloc();
+    if(addr == NULL) {
+      perror("addr alloc");
+      return 1;
+    }
+
+    // Fill out the mandatory attributes of the new address. Setting the
+    // local address will automatically set the address family and the
+    // prefix length to the correct values.
+    rtnl_addr_set_ifindex(addr, ifindex);
+    if((local_addr = nl_addr_build(AF_INET, &ip, 4)) == NULL) {
+      perror("addr parse");
+      exit(1);
+    }
+    ip = ntohl(ip);
+    ip += 4;
+    ip = htonl(ip);
+    local_addr->a_prefixlen = 30;
+    char tmp[1024];
+    nl_addr2str (local_addr, tmp, 1024);
+    printf("setting ip %s on intf br0(%d)\n", tmp, ifindex);
+    if(rtnl_addr_set_local(addr, local_addr) != 0) {
+      perror("addr_set_local");
+      exit(1);
+    }
+    
+    // Build the netlink message and send it to the kernel, the operation will
+    // block until the operation has been completed. Alternatively the required
+    // netlink message can be built using rtnl_addr_build_add_request() to be
+    // sent out using nl_send_auto_complete().
+    int ret = rtnl_addr_add(sk, addr, 0);
+    if( (ret < 0) && ( abs(ret) != NLE_EXIST)) {
+      nl_perror(ret, "addr_set_local");
+      exit(1);
+    } 
+  }
+
   char errbuf[PCAP_ERRBUF_SIZE];
-  obj_cfg.data_pcap = pcap_open_live(obj_cfg.data_dev_name, 70, 1, 0, errbuf);
+  obj_cfg.data_pcap = pcap_open_live(obj_cfg.data_dev_name, 80, 1, 0, errbuf);
   if(obj_cfg.data_pcap == NULL) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);
@@ -419,18 +515,34 @@ init_pcap() {
   if(obj_cfg.data_pcap_fd < 0) {
     printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.data_pcap));
     exit(1);
-  } 
-  
+  } 	 
+  if (pcap_compile(obj_cfg.data_pcap, &fp, "src port 7", 0, 0) == -1) {
+    fprintf(stderr, "Couldn't parse filter src port 7: %s\n", pcap_geterr(obj_cfg.data_pcap));
+    exit(2);
+  }	 
+  if (pcap_setfilter(obj_cfg.data_pcap, &fp) == -1) {
+    fprintf(stderr, "Couldn't install filter src port 7: %s\n", pcap_geterr(obj_cfg.data_pcap));
+    exit(2);
+  }
+
   //set pcap fd in non blocking, so that I can select on it. 
   if(pcap_setnonblock(obj_cfg.data_pcap, 0, errbuf) < -1) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);    
   }
 
-  obj_cfg.echo_pcap = pcap_open_live(obj_cfg.echo_dev_name, 70, 1, 0, errbuf);
+  obj_cfg.echo_pcap = pcap_open_live(obj_cfg.echo_dev_name, 80, 1, 0, errbuf);
   if(obj_cfg.echo_pcap == NULL) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);
+  } 
+  if (pcap_compile(obj_cfg.echo_pcap, &fp, "dst port 7", 0, 0) == -1) {
+    fprintf(stderr, "Couldn't parse filter dst port 7: %s\n", pcap_geterr(obj_cfg.echo_pcap));
+    exit(2);
+  }	 
+  if (pcap_setfilter(obj_cfg.echo_pcap, &fp) == -1) {
+    fprintf(stderr, "Couldn't install filter dst port 7: %s\n", pcap_geterr(obj_cfg.echo_pcap));
+    exit(2);
   }
   
   obj_cfg.echo_pcap_fd = pcap_fileno(obj_cfg.echo_pcap);
@@ -490,6 +602,14 @@ process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr)) {
     state = malloc(sizeof(struct pkt_state));
     bzero(state,sizeof(struct pkt_state));
+    /* printf("%ld.%06ld;%ld.%06ld;%ld.%06ld;%ld\n",   */
+    /* 	    (long int)ntohl(hdr->pktgen->echo_snd_tv_sec),   */
+    /* 	    (long int)ntohl(hdr->pktgen->echo_snd_tv_usec), */
+    /* 	    (long int)ntohl(hdr->pktgen->echo_rcv_tv_sec),   */
+    /* 	    (long int)ntohl(hdr->pktgen->echo_rcv_tv_usec), */
+    /* 	    (long int)pkt_header->ts.tv_sec,   */
+    /* 	    (long int)pkt_header->ts.tv_usec,  */
+    /* 	    (long int)ntohl(hdr->pktgen->id));   */
     state->seq_num = ntohl(hdr->pktgen->id);
     state->data_rcv_ts.tv_sec = pkt_header->ts.tv_sec;
     state->data_rcv_ts.tv_usec = pkt_header->ts.tv_usec;
@@ -523,12 +643,9 @@ generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
 
   if((ether->ether_type != htons(ETHERTYPE_IP)) ||
      (ip->protocol != IPPROTO_UDP) ||
-     (udp->source != htons(41215)) || (udp->dest != htons(53))) {
-    printf("received incorect packet\n");
+     (udp->dest != htons(7))) {
     return;
   }
-
-  printf("packet received on echo server\n");  
   //revert mac address
   memcpy(tmp_mac, ether->ether_shost, ETH_ALEN); 
   memcpy(ether->ether_shost, ether->ether_dhost, ETH_ALEN); 
@@ -547,10 +664,10 @@ generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   udp->dest = tmp_port;
 
   //append timestamp
-  printf("packet received pkt %ld\n",(long int) ntohl(pktgen->id));
   pktgen->echo_rcv_tv_sec = htonl(pkt_header->ts.tv_sec);
   pktgen->echo_rcv_tv_usec = htonl(pkt_header->ts.tv_usec);
-  
+  /* printf("%ld:%06ld packet received pkt %ld\n",ntohl(pktgen->echo_rcv_tv_sec), */
+  /* 	 ntohl(pktgen->echo_rcv_tv_usec), (long int) ntohl(pktgen->id)); */
   send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
 }
 
@@ -558,7 +675,7 @@ void
 get_snmp_status(struct timeval *ts) {
   netsnmp_session *ss;    
   netsnmp_pdu *pdu;
-  netsnmp_pdu *response;
+ netsnmp_pdu *response;
   int status, count;
   netsnmp_variable_list *vars;
 
@@ -698,8 +815,8 @@ echo_generate( void *ptr ) {
     pthread_yield();
     gettimeofday(&now, NULL);    
     if(timediff(&now, &last_pkt) >= delay ) {
-      /* printf("delay : %ld, now : %ld.%06ld, last : %ld.%06ld diff %ld\n", delay, now.tv_sec, now.tv_usec,  */
-      /* 	     last_pkt.tv_sec, last_pkt.tv_usec, timediff(&now, &last_pkt)); */
+      /* printf("delay : %ld, now : %ld.%06ld, last : %ld.%06ld diff %ld\n", (long int)delay, now.tv_sec,  */
+      /* 	     now.tv_usec, last_pkt.tv_sec, last_pkt.tv_usec, (long int)timediff(&now, &last_pkt));  */
       generate_packet(obj_cfg.pkt_size);
       last_pkt.tv_usec += delay%1000000;
       if(last_pkt.tv_usec >= 1000000) {
@@ -710,6 +827,8 @@ echo_generate( void *ptr ) {
     } else if (timediff(&now, &start) >= obj_cfg.duration*1000000) {
       break;
     }
+
+    //if(pkt_count >= 1) break;
   }
 
   obj_cfg.finished = 1;
@@ -758,17 +877,7 @@ data_generate( void *ptr ) {
   printf_and_check(intf_file, msg);
   snprintf(msg, 1024, "pkt_size %d", obj_cfg.pkt_size);
   printf_and_check(intf_file, msg);
-
-  if(strcmp(obj_cfg.flow_type, "wildcard") == 0) {
-    printf_and_check(intf_file,  "dst_min 10.3.1.0");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.1.0")) + ((obj_cfg.flow_num) << 8) - 1);
-  } else if (strcmp(obj_cfg.flow_type, "exact")== 0) {
-    printf_and_check(intf_file,  "dst_min 10.3.0.1");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.1")) + (obj_cfg.flow_num));
-  } else  {
-    printf("Invalid flow type\n");
-    exit(1);
-  }
+  printf_and_check(intf_file,  "dst_min 10.2.0.6");
   snprintf(msg, 1024, "dst_max %s", (char *)inet_ntoa(addr)); 
   printf_and_check(intf_file, msg);
   printf_and_check(intf_file,"flag IPDST_RND");
@@ -779,8 +888,8 @@ data_generate( void *ptr ) {
   printf_and_check(intf_file, "vlan_cfi 0"); 
   printf_and_check(intf_file, "dst_mac 10:20:30:40:50:60");
   printf_and_check(intf_file, "src_mac 10:20:30:40:50:61");
-  printf_and_check(intf_file, "src_min 10.2.0.1");
-  printf_and_check(intf_file, "src_max 10.2.0.1");
+  printf_and_check(intf_file, "src_min 10.2.0.2");
+  printf_and_check(intf_file, "src_max 10.2.0.2");
   printf_and_check(intf_file, "tos 0");
   printf_and_check(intf_file, "udp_src_max 8080");
   printf_and_check(intf_file, "udp_src_min 8080");
@@ -798,11 +907,13 @@ process_data() {
   struct pkt_state *state;
   while (head.tqh_first != NULL) {
     state = head.tqh_first;
-    fprintf(obj_cfg.pkt_file, "%ld.%06ld;%ld.%06ld;%ld;%s\n",  
-	    (long int)state->data_rcv_ts.tv_sec,  
-	    (long int)state->data_rcv_ts.tv_usec, 
+    fprintf(obj_cfg.pkt_file, "%ld.%06ld;%ld.%06ld;%ld.%06ld;%ld;%s\n",  
 	    (long int)state->data_snd_ts.tv_sec,  
 	    (long int)state->data_snd_ts.tv_usec,
+	    (long int)state->echo_snd_ts.tv_sec,  
+	    (long int)state->echo_snd_ts.tv_usec,
+	    (long int)state->data_rcv_ts.tv_sec,  
+	    (long int)state->data_rcv_ts.tv_usec, 
 	    (long int)state->seq_num,
 	    (char *)inet_ntoa(state->nw_dst));  
     TAILQ_REMOVE(&head, head.tqh_first, entries);
@@ -848,8 +959,8 @@ generate_packet(int len) {
   uint32_t dst_ip = ntohl(inet_addr("10.3.0.0")) + (rand()%65533) + 4;
 
   ether = (struct ether_header *)pkt_buf;
-  memcpy(ether->ether_shost, "\x08\x00\x27\x62\x1c\x95" /*"\x08\x00\x27\x89\x68\xfa"*/, ETH_ALEN); 
-  memcpy(ether->ether_dhost, "\x08\x00\x27\x33\x3a\x38" /*"\x08\x00\x27\x75\xff\x61"*/, ETH_ALEN); 
+  memcpy(ether->ether_shost, "\x08\x00\x27\x89\x68\xfa", ETH_ALEN); 
+  memcpy(ether->ether_dhost, "\x08\x00\x27\x75\xff\x61", ETH_ALEN); 
   ether->ether_type = htons(ETHERTYPE_IP);
 
   ip = (struct iphdr *)(pkt_buf + ETHER_HDR_LEN);
@@ -860,13 +971,13 @@ generate_packet(int len) {
   //  ip->id = htons(id++);
   ip->protocol = IPPROTO_UDP;
   ip->tot_len = htons(len - ETHER_HDR_LEN );
-  ip->saddr = htonl(src_ip);
+  ip->saddr =  htonl(src_ip);
   ip->daddr = htonl(dst_ip);
   ip->check =  Checksum((uint16_t *)ip, 20);
   
   udp = (struct udphdr *)(pkt_buf + ETHER_HDR_LEN + sizeof(struct iphdr));
-  udp->source = htons(41215);
-  udp->dest =  htons(53);
+  udp->source = htons((rand()%60000) + 5000 );
+  udp->dest =  htons(7);
   udp->len = htons(len -  ETHER_HDR_LEN - sizeof(struct iphdr));
   udp->check = 0; //htons(0x4a77);
 
@@ -877,7 +988,8 @@ generate_packet(int len) {
   pktgen->echo_snd_tv_sec = htonl(now.tv_sec);
   pktgen->echo_snd_tv_usec = htonl(now.tv_usec);
   
-  printf("seding packet %d\n", pkt_count);
+  if(pkt_count % 1000 == 0)
+    printf("seding packet %d\n", pkt_count);
 
   send_data_raw_socket(obj_cfg.data_dev_fd, obj_cfg.data_dev_ix, pkt_buf, len);
 }
@@ -979,7 +1091,7 @@ main(int argc, char **argv) {
 
   if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) 
       || (pthread_create( &thrd_echo, NULL, echo_generate, NULL)) 
-      || (pthread_create( &thrd_data, NULL, data_generate, NULL)) 
+      //|| (pthread_create( &thrd_data, NULL, data_generate, NULL)) 
       ) {
     perror("pthread_create");
     exit(1);
@@ -987,7 +1099,7 @@ main(int argc, char **argv) {
 
   pthread_join(thrd_capture, NULL);
   pthread_join(thrd_echo, NULL); 
-  pthread_join(thrd_data, NULL); 
+  //pthread_join(thrd_data, NULL); 
 
   process_data();
   destroy_cfg();
