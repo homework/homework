@@ -19,7 +19,7 @@ documentation for details; in short they are a way to include by
 reference other repositories within your own.  As a result, obtaining
 the complete set of code is a two-stage process:
 
-    $ git clone git://github.com/mor1/homework.git
+    $ git clone git://github.com/homework/homework.git
     $ cd homework
     $ git submodule init && git submodule update
 
