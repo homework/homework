@@ -62,6 +62,8 @@ struct test_cfg {
   FILE *pkt_file;
   FILE *snmp_file;
   
+  int exact_num;
+  int wild_num;
   int flow_num;
   char *flow_type;
 
@@ -179,6 +181,22 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
     if( ((str_val = (char *)config_setting_get_string(elem)) == NULL) || 
 	((test_cfg->snmp_file = fopen(str_val, "w")) == NULL) ) {
       perror("Failed to open snmp_output filename\n");
+      exit(1);
+    }
+  }
+
+  elem = config_lookup(&conf, "switch_test_delay.exact_num");
+  if(elem != NULL) {
+    if((test_cfg->exact_num = config_setting_get_int(elem)) == 0) {
+      printf("Failed to read flow_num\n");
+      exit(1);
+    }
+  }
+
+  elem = config_lookup(&conf, "switch_test_delay.wild_num");
+  if(elem != NULL) {
+    if((test_cfg->wild_num = config_setting_get_int(elem)) == 0) {
+      printf("Failed to read flow_num\n");
       exit(1);
     }
   }
@@ -309,8 +327,14 @@ install_flows() {
     
     //set url
     addr.s_addr = obj_cfg.server_ip;
-    snprintf(msg, 1024, "https://%s/ws.v1/switch_delay_test/installflows/%d/%s", (char *)inet_ntoa(addr), 
+
+     if (strcmp(obj_cfg.flow_type, "mix")== 0) {       
+       snprintf(msg, 1024, "https://%s/ws.v1/switch_delay_test/mixflows/exact/%d/wild/%d", (char *)inet_ntoa(addr), 
+	     obj_cfg.exact_num, obj_cfg.wild_num);
+     } else { 
+       snprintf(msg, 1024, "https://%s/ws.v1/switch_delay_test/installflows/%d/%s", (char *)inet_ntoa(addr), 
 	     obj_cfg.flow_num, obj_cfg.flow_type);
+     }
     curl_easy_setopt(curl, CURLOPT_URL, msg);
     
     // this is an http get request
@@ -613,11 +637,14 @@ packet_generate( void *ptr ) {
   printf_and_check(intf_file, msg);
 
   if(strcmp(obj_cfg.flow_type, "wildcard") == 0) {
-    printf_and_check(intf_file,  "dst_min 10.3.1.0");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.1.0")) + ((obj_cfg.flow_num) << 8) - 1);
+    printf_and_check(intf_file,  "dst_min 10.3.0.0");
+    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + ((obj_cfg.flow_num) << 8) - 1);
   } else if (strcmp(obj_cfg.flow_type, "exact")== 0) {
-    printf_and_check(intf_file,  "dst_min 10.3.0.1");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.1")) + (obj_cfg.flow_num));
+    printf_and_check(intf_file,  "dst_min 10.3.0.0");
+    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + (obj_cfg.flow_num));
+  } else if (strcmp(obj_cfg.flow_type, "mix")== 0) {
+    printf_and_check(intf_file,  "dst_min 10.3.0.0");
+    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + obj_cfg.exact_num + (obj_cfg.wild_num*256));
   } else  {
     printf("Invalid flow type\n");
     exit(1);
