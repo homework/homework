@@ -21,13 +21,7 @@
 #include <linux/netlink.h> 
 #include <netlink/object-api.h>
 #include <linux/pkt_sched.h>
-struct ucred
-{
-  pid_t pid;			/* PID of sending process.  */
-  uid_t uid;			/* UID of sending process.  */
-  gid_t gid;			/* GID of sending process.  */
-};
-#include <netlink-types.h> 
+#include <netlink/types.h> 
 #include <netlink/addr.h>
 #include <netlink/socket.h>
 #include <netlink/route/link.h> 
@@ -484,7 +478,8 @@ init_pcap() {
     ip = ntohl(ip);
     ip += 4;
     ip = htonl(ip);
-    local_addr->a_prefixlen = 30;
+    nl_addr_set_prefixlen (local_addr, 30);
+    //    local_addr->a_prefixlen = 30;
     char tmp[1024];
     nl_addr2str (local_addr, tmp, 1024);
     printf("setting ip %s on intf br0(%d)\n", tmp, ifindex);
@@ -644,6 +639,7 @@ generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   if((ether->ether_type != htons(ETHERTYPE_IP)) ||
      (ip->protocol != IPPROTO_UDP) ||
      (udp->dest != htons(7))) {
+	printf("Invalid packet\n");
     return;
   }
   //revert mac address
@@ -666,8 +662,8 @@ generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   //append timestamp
   pktgen->echo_rcv_tv_sec = htonl(pkt_header->ts.tv_sec);
   pktgen->echo_rcv_tv_usec = htonl(pkt_header->ts.tv_usec);
-  /* printf("%ld:%06ld packet received pkt %ld\n",ntohl(pktgen->echo_rcv_tv_sec), */
-  /* 	 ntohl(pktgen->echo_rcv_tv_usec), (long int) ntohl(pktgen->id)); */
+  //  printf("%ld:%06ld packet received pkt %ld\n",ntohl(pktgen->echo_rcv_tv_sec), 
+  // ntohl(pktgen->echo_rcv_tv_usec), (long int) ntohl(pktgen->id)); 
   send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
 }
 
@@ -959,8 +955,8 @@ generate_packet(int len) {
   uint32_t dst_ip = ntohl(inet_addr("10.3.0.0")) + (rand()%65533) + 4;
 
   ether = (struct ether_header *)pkt_buf;
-  memcpy(ether->ether_shost, "\x08\x00\x27\x89\x68\xfa", ETH_ALEN); 
-  memcpy(ether->ether_dhost, "\x08\x00\x27\x75\xff\x61", ETH_ALEN); 
+  memcpy(ether->ether_shost, "\x00\x0a\x5e\x54\x2c\xc0", ETH_ALEN); 
+  memcpy(ether->ether_dhost, "\x90\xe6\xba\x20\xb2\xbb", ETH_ALEN); 
   ether->ether_type = htons(ETHERTYPE_IP);
 
   ip = (struct iphdr *)(pkt_buf + ETHER_HDR_LEN);
@@ -1084,10 +1080,10 @@ main(int argc, char **argv) {
     exit(1);
   }
 
-  initialize_snmp();
   initialize_raw_socket();
   init_pcap();
   install_flows();
+  initialize_snmp();
 
   if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) 
       || (pthread_create( &thrd_echo, NULL, echo_generate, NULL)) 

@@ -28,6 +28,7 @@
 
 uint8_t pkt_buf[3000];
 uint32_t pkt_count = 0;
+uint32_t acked = 0;
 
 struct nw_hdr {
   struct ether_header *ether;
@@ -38,9 +39,11 @@ struct nw_hdr {
 
 struct pkt_state {
   uint8_t addr[6];
+  struct timeval start_ts;
   struct timeval dhcp_offer_ts;
   struct timeval dhcp_ack_ts;
   int state;
+  uint32_t ip;
   TAILQ_ENTRY(pkt_state) entries;
 };
 TAILQ_HEAD(tailhead, pkt_state) head;
@@ -80,6 +83,8 @@ struct test_cfg {
 
 int my_read_objid(char *in_oid, oid *out_oid, size_t *out_oid_len);
 void send_data_raw_socket(int fd, int ix,  void *msg, int len);
+void send_dhcp_discovery(uint8_t *mac_addr, uint32_t xid, uint8_t dhcp_msg_type,
+		    char *hostname, uint32_t request_ip, uint32_t server_ip);
 
 uint16_t Checksum(const uint16_t* buf, unsigned int nbytes) {
   uint32_t sum = 0;
@@ -232,7 +237,7 @@ init_pcap() {
   char errbuf[PCAP_ERRBUF_SIZE];
   struct bpf_program fp;
 
-  obj_cfg.pcap = pcap_open_live(obj_cfg.dev_name, 70, 1, 0, errbuf);
+  obj_cfg.pcap = pcap_open_live(obj_cfg.dev_name, 2000, 1, 0, errbuf);
   if(obj_cfg.pcap == NULL) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);
@@ -300,7 +305,7 @@ extract_headers(uint8_t *data, uint32_t data_len, struct nw_hdr *hdr) {
 }
 
 struct pkt_state *
-get_state(uint8_t mac_addr) {
+get_state(uint8_t *mac_addr) {
   struct pkt_state *np;
   for (np = head.tqh_first; np != NULL; np = np->entries.tqe_next) 
     if(memcmp(np->addr, mac_addr, 6) == 0) break;
@@ -313,19 +318,19 @@ process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   char nw_src[20], nw_dst[20];
   struct pkt_state *state;
 
-  printf("received reply\n");
-
   bzero(hdr,sizeof(struct nw_hdr));
   if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr)) {
 
     if( (state = get_state(hdr->ether->ether_dhost)) == NULL ) {
+      printf("generate new state\n");
       state = malloc(sizeof(struct pkt_state));
       bzero(state,sizeof(struct pkt_state));
       memcpy(state->addr, hdr->ether->ether_dhost, 6);
+      TAILQ_INSERT_TAIL(&head, state, entries);
     }
 
     //parse options
-    uint8_t *data = hdr->dhcp + sizeof(struct dhcp_packet);
+    uint8_t *data = (((uint8_t *)hdr->dhcp) + sizeof(struct dhcp_packet));
     uint16_t len = pkt_header->caplen - 
       (((int)hdr->dhcp - (int)pkt_data) + sizeof(struct dhcp_packet));
 
@@ -335,78 +340,45 @@ process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
       uint8_t dhcp_option = data[0];
       uint8_t dhcp_option_len = data[1];
       
-      printf("pos %d len %d type %d\n", data, dhcp_option_len, dhcp_option);
+      if (dhcp_option_len == 0) exit(1);
 
-      if(dhcp_option == 0xff) {
-      	//printf("Got end of options!!!!\n");
-     	break;
+      if(dhcp_option == 0x100) {
+        //printf("Got end of options!!!!\n");
+        break;
       } else if(dhcp_option == 53) {
-	dhcp_msg_type = data[2];
-	if((dhcp_msg_type <1) || (dhcp_msg_type > 8)) {
-	  printf("Invalid DHCP Message Type : %d\n", dhcp_msg_type);
-	  return;
-	} 
+        dhcp_msg_type = data[2];
+        if((dhcp_msg_type <1) || (dhcp_msg_type > 8)) {
+          printf("Invalid DHCP Message Type : %d\n", dhcp_msg_type);
+          return;
+        } 
+        break;
       }
-    
       len -= (2 + dhcp_option_len );
       data += (2 + dhcp_option_len );
     }
-    printf("dhcp type : %d, offered ip : %lx\n",  
-	   dhcp_msg_type, hdr->dhcp->yiaddr);
+    //printf("dhcp type : %d, offered ip : %s\n",  
+    //    dhcp_msg_type, (char *)inet_ntoa(hdr->dhcp->yiaddr));
 
+    if(dhcp_msg_type == DHCPOFFER ) {
+      if(state->state == DHCP_INIT) {
+        state->ip = hdr->dhcp->yiaddr; 
+        //printf("offered ip %s\n", (char *)inet_ntoa(hdr->dhcp->yiaddr));
+        send_dhcp_discovery(hdr->ether->ether_dhost, hdr->dhcp->xid, DHCPREQUEST, 
+            "test", ntohl(hdr->dhcp->yiaddr), ntohl(hdr->dhcp->siaddr));
+        state->state = DHCP_OFFERED;
+        memcpy(&state->dhcp_offer_ts, &pkt_header->ts, sizeof(struct timeval));
+      }
+    } else if(dhcp_msg_type == DHCPACK ) {      
+      //printf("acked %d, state: %d\n", acked, state->state);
+      if(state->state == DHCP_OFFERED) {
+        state->state == DHCP_ACKED;
+        memcpy(&state->dhcp_ack_ts, &pkt_header->ts, sizeof(struct timeval));
+        acked++;
+        if(acked == obj_cfg.flow_num) obj_cfg.finished = 1;
+       }
+
+    }
   }
-}
-
-void 
-generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
-  char nw_src[20], nw_dst[20], *msg, tmp_mac[ETH_ALEN];
-  struct pkt_state *state;
-  struct ether_header *ether;
-  struct iphdr *ip;
-  struct udphdr *udp;
-  struct  pktgen_hdr *pktgen;
-  uint32_t tmp_ip;
-  uint16_t tmp_port;
-
-  msg = malloc(pkt_header->len);
-  memcpy(msg, pkt_data, pkt_header->caplen);
-
-  ether = (struct ether_header *)msg;
-  ip = (struct iphdr *)(msg + ETHER_HDR_LEN);
-  udp = (struct udphdr *)(msg + ETHER_HDR_LEN + sizeof(struct iphdr)); 
-  pktgen = (struct pktgen_hdr *)(msg + ETHER_HDR_LEN + sizeof(struct iphdr) + sizeof(struct udphdr)); 
-
-  if((ether->ether_type != htons(ETHERTYPE_IP)) ||
-     (ip->protocol != IPPROTO_UDP) ||
-     (udp->source != htons(41215)) || (udp->dest != htons(53))) {
-    printf("received incorect packet\n");
-    return;
-  }
-
-  printf("packet received on echo server\n");  
-  //revert mac address
-  memcpy(tmp_mac, ether->ether_shost, ETH_ALEN); 
-  memcpy(ether->ether_shost, ether->ether_dhost, ETH_ALEN); 
-  memcpy(ether->ether_dhost, tmp_mac, ETH_ALEN); 
-  
-  //revert ip addr
-  tmp_ip = ip->saddr;
-  ip->saddr = ip->daddr;
-  ip->daddr = tmp_ip;
-  ip->check =  0;
-  ip->check =  Checksum((uint16_t *)ip, 20);
-  
-  //revert ip address
-  tmp_port = udp->source; 
-  udp->source = udp->dest; 
-  udp->dest = tmp_port;
-
-  //append timestamp
-  /* printf("packet received pkt %ld\n",(long int) ntohl(pktgen->id)); */
-  /* pktgen->echo_rcv_tv_sec = htonl(pkt_header->ts.tv_sec); */
-  /* pktgen->echo_rcv_tv_usec = htonl(pkt_header->ts.tv_usec); */
-  
-  //send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
 }
 
 void
@@ -552,7 +524,7 @@ send_dhcp_discovery(uint8_t *mac_addr, uint32_t xid, uint8_t dhcp_msg_type,
   len++;
   
   ip->tot_len = htons(len - sizeof(struct ether_header));
-  ip->check = Checksum(ip, 20);
+  ip->check = Checksum((const uint16_t*)ip, 20);
   udp->len = htons(len - sizeof(struct ether_header) - sizeof(struct iphdr));
   
   send_data_raw_socket(obj_cfg.dev_fd, obj_cfg.dev_ix, pkt_buf, len);
@@ -562,9 +534,15 @@ void *
 dhcp_discovery_thread( void *ptr ) {
   uint8_t mac_addr[] = {0x08, 0x00, 0x27, 0xee, 0x1d, 0x00};
   int32_t i;
-  
+  struct pkt_state *state;
+
   for( i = 0; i < obj_cfg.flow_num;i++) {
     mac_addr[5] = i;
+    state = malloc(sizeof(struct pkt_state));
+    bzero(state,sizeof(struct pkt_state));
+    memcpy(state->addr, mac_addr, 6);
+    gettimeofday(&state->start_ts, NULL);
+    TAILQ_INSERT_TAIL(&head, state, entries);
     send_dhcp_discovery(mac_addr, 0x223311,  DHCPDISCOVER, "hello", 0 ,0 );
   }
 }
@@ -572,11 +550,12 @@ dhcp_discovery_thread( void *ptr ) {
 void *
 packet_capture( void *ptr ) {
   fd_set set;
-  struct timeval timeout, last_snmp, now;
+  struct timeval timeout, last_snmp, now, start;
   struct pcap_pkthdr *pkt_header;
   const u_char *pkt_data;
   int ret;
 
+  gettimeofday(&start, NULL); 
   gettimeofday(&last_snmp, NULL);
   get_snmp_status(&last_snmp);
   
@@ -606,7 +585,7 @@ packet_capture( void *ptr ) {
 
     //printf(" %ld.%06ld: timed out at %ld.%06ld\n", now.tv_sec, now.tv_usec, timeout.tv_sec, timeout.tv_usec);
     if( (ret = select(FD_SETSIZE, &set, NULL, NULL, 
-		      &timeout)) < 0) {
+            &timeout)) < 0) {
       perror("capture select");
       exit(1);
     }
@@ -615,17 +594,19 @@ packet_capture( void *ptr ) {
       get_snmp_status(&last_snmp);
       printf("send snmp %ld\n", last_snmp.tv_sec);
     } else {
-       /* Service all the sockets with input pending. */
+      /* Service all the sockets with input pending. */
       if (FD_ISSET(obj_cfg.pcap_fd, &set))  {
-	if(pcap_next_ex(obj_cfg.pcap, &pkt_header,
-			&pkt_data) < 0) {
-	  perror("pcap_next_en");
-	  exit(1);
-	}
-	process_pcap_pkt(pkt_data, pkt_header);
+        if(pcap_next_ex(obj_cfg.pcap, &pkt_header,
+              &pkt_data) < 0) {
+          perror("pcap_next_en");
+          exit(1);
+        }
+        process_pcap_pkt(pkt_data, pkt_header);
       }
     }
-  };
+    if(now.tv_sec - start.tv_sec > 60) 
+      break;
+  }
   printf("this is the packet capturer\n");
 };
 
@@ -658,14 +639,16 @@ process_data() {
   struct pkt_state *state;
   while (head.tqh_first != NULL) {
     state = head.tqh_first;
-    /* fprintf(obj_cfg.pkt_file, "%ld.%06ld;%ld.%06ld;%ld;%s\n",   */
-    /* 	    (long int)state->data_rcv_ts.tv_sec,   */
-    /* 	    (long int)state->data_rcv_ts.tv_usec,  */
-    /* 	    (long int)state->data_snd_ts.tv_sec,   */
-    /* 	    (long int)state->data_snd_ts.tv_usec, */
-    /* 	    (long int)state->seq_num, */
-    /* 	    (char *)inet_ntoa(state->nw_dst));   */
-    /* TAILQ_REMOVE(&head, head.tqh_first, entrie s);*/
+    fprintf(obj_cfg.pkt_file, "%02x:%02x:%02x:%02x:%02x:%02x;%ld.%06ld;%ld.%06ld;%ld.%06ld;%s\n",   
+        state->addr[0],state->addr[1],state->addr[2],state->addr[3],state->addr[4],state->addr[5],
+        (long int)state->start_ts.tv_sec,   
+        (long int)state->start_ts.tv_usec,  
+        (long int)state->dhcp_offer_ts.tv_sec,   
+        (long int)state->dhcp_offer_ts.tv_usec,  
+        (long int)state->dhcp_ack_ts.tv_sec,   
+        (long int)state->dhcp_ack_ts.tv_usec,
+        (char *)inet_ntoa(state->ip));   
+    TAILQ_REMOVE(&head, head.tqh_first, entries);
     free(state);
   }
   //fclose(obj_cfg.pkt_file);
@@ -713,6 +696,11 @@ send_data_raw_socket(int fd, int ix, void *msg, int len) {
   if ( ret < 0 && errno != ENOBUFS ) {
     fprintf(stderr, "sending of data failed\n");
   }
+  if ( ret < 0 && errno == ENOBUFS ) {
+    printf(stderr, "buffer fulll!\n");
+  }
+
+
 }
 
 
