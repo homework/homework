@@ -26,6 +26,8 @@
 
 #include "dhcp.h"
 
+#define DHCP_DISCOVERY_DELAY 10000
+
 uint8_t pkt_buf[3000];
 uint32_t pkt_count = 0;
 uint32_t acked = 0;
@@ -490,8 +492,7 @@ send_dhcp_discovery(uint8_t *mac_addr, uint32_t xid, uint8_t dhcp_msg_type,
   
   //setting up dhcp msg type
   options[0] = 53;
-  options[1] = 1;
-  options[2] = dhcp_msg_type;
+  options[1] = 1;  options[2] = dhcp_msg_type;
   options += 3;
   len += 3;
   
@@ -535,6 +536,7 @@ dhcp_discovery_thread( void *ptr ) {
   uint8_t mac_addr[] = {0x08, 0x00, 0x27, 0xee, 0x1d, 0x00};
   int32_t i;
   struct pkt_state *state;
+  struct timeval now, prev;
 
   for( i = 0; i < obj_cfg.flow_num;i++) {
     mac_addr[5] = i;
@@ -544,6 +546,12 @@ dhcp_discovery_thread( void *ptr ) {
     gettimeofday(&state->start_ts, NULL);
     TAILQ_INSERT_TAIL(&head, state, entries);
     send_dhcp_discovery(mac_addr, 0x223311,  DHCPDISCOVER, "hello", 0 ,0 );
+    gettimeofday(&prev, NULL);
+    gettimeofday(&now, NULL); 
+    while(timediff(&now, &prev) < DHCP_DISCOVERY_DELAY) {
+      gettimeofday(&now, NULL);
+      pthread_yield();
+    }
   }
 }
 

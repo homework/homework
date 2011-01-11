@@ -512,11 +512,11 @@ get_snmp_status(struct timeval *ts) {
 	free(sp);
       } else if ((vars->type == ASN_INTEGER)  || (vars->type == 0x41)) {
 	if( memcmp(vars->name, obj_cfg.pkt_in_OID, obj_cfg.pkt_in_OID_len*sizeof(int)) == 0) 
-	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_in;1;%ld\n", ts->tv_sec, ts->tv_usec, 
+	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_in;1;%lu\n", ts->tv_sec, ts->tv_usec, 
 		  *vars->val.integer);
 	
 	if( memcmp(vars->name, obj_cfg.pkt_out_OID, obj_cfg.pkt_out_OID_len*sizeof(int)) == 0) 
-	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_out;1;%ld\n", ts->tv_sec, ts->tv_usec, 
+	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_out;1;%lu\n", ts->tv_sec, ts->tv_usec, 
 		  *vars->val.integer);
 	
       } else 
@@ -636,19 +636,20 @@ packet_generate( void *ptr ) {
   snprintf(msg, 1024, "pkt_size %d", obj_cfg.pkt_size);
   printf_and_check(intf_file, msg);
 
-  if(strcmp(obj_cfg.flow_type, "wildcard") == 0) {
-    printf_and_check(intf_file,  "dst_min 10.3.0.0");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + ((obj_cfg.flow_num) << 8) - 1);
-  } else if (strcmp(obj_cfg.flow_type, "exact")== 0) {
+/*   if(strcmp(obj_cfg.flow_type, "wildcard") == 0) { */
+/*     printf_and_check(intf_file,  "dst_min 10.3.0.0"); */
+/*     addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + ((obj_cfg.flow_num) << 8) - 1); */
+/*   } else if (strcmp(obj_cfg.flow_type, "exact")== 0) { */
     printf_and_check(intf_file,  "dst_min 10.3.0.0");
     addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + (obj_cfg.flow_num));
-  } else if (strcmp(obj_cfg.flow_type, "mix")== 0) {
-    printf_and_check(intf_file,  "dst_min 10.3.0.0");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + obj_cfg.exact_num + (obj_cfg.wild_num*256));
-  } else  {
-    printf("Invalid flow type\n");
-    exit(1);
-  }
+/*   } else if (strcmp(obj_cfg.flow_type, "mix")== 0) { */
+/*     printf_and_check(intf_file,  "dst_min 10.3.0.0"); */
+/*     addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + obj_cfg.exact_num + (obj_cfg.wild_num*256)); */
+/*   }  */
+/*   else  { */
+/*     printf("Invalid flow type\n"); */
+/*     exit(1); */
+/*   } */
   snprintf(msg, 1024, "dst_max %s", (char *)inet_ntoa(addr)); 
   printf_and_check(intf_file, msg);
   printf_and_check(intf_file,"flag IPDST_RND");
