@@ -3,12 +3,29 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <pcap.h>
+#include <time.h>
+#include <errno.h>
 #include <sys/time.h>
 #include <sys/queue.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
 
+#include <sys/socket.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <linux/if_arp.h>
 #include <net/ethernet.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
+
+#include <linux/netlink.h> 
+#include <netlink/object-api.h>
+#include <linux/pkt_sched.h>
+#include <netlink/types.h> 
+#include <netlink/addr.h>
+#include <netlink/socket.h>
+#include <netlink/route/link.h> 
+#include <netlink/route/addr.h> 
 
 #include <glib-object.h>
 #include <json-glib/json-glib.h>
@@ -20,11 +37,15 @@
 
 #include <libconfig.h>
 
+uint8_t pkt_buf[3000];
+uint32_t pkt_count = 0;
+
 struct pktgen_hdr {
-  uint32_t magic;
-  uint32_t seq_num;
-  uint32_t tv_sec;
-  uint32_t tv_usec;
+  uint32_t id;
+  uint32_t echo_snd_tv_sec;
+  uint32_t echo_snd_tv_usec;
+  uint32_t echo_rcv_tv_sec;
+  uint32_t echo_rcv_tv_usec;
 };
 struct nw_hdr {
   struct ether_header *ether;
@@ -35,26 +56,36 @@ struct nw_hdr {
 
 struct pkt_state {
   uint32_t seq_num;
-  struct timeval rcv_ts, snd_ts;
+  struct timeval data_rcv_ts, echo_snd_ts, data_snd_ts;
   uint32_t nw_dst;
   TAILQ_ENTRY(pkt_state) entries;
 };
 TAILQ_HEAD(tailhead, pkt_state) head;
 
 struct test_cfg {
-  uint32_t server_ip;
-  uint16_t server_port;
 
+  //snmp details
+  uint32_t server_ip;
   oid cpu_OID[MAX_OID_LEN];
   oid pkt_in_OID[MAX_OID_LEN];
   oid pkt_out_OID[MAX_OID_LEN];
   size_t cpu_OID_len;
   size_t pkt_in_OID_len;
   size_t pkt_out_OID_len;
-
   char *snmp_community;
   netsnmp_session session;
-  char *intf_name;
+
+  //device details
+  char *data_dev_name;
+  int data_dev_fd;
+  int data_dev_ix;
+  pcap_t *data_pcap;
+  int data_pcap_fd;
+  char *echo_dev_name;
+  int echo_dev_fd;
+  int echo_dev_ix;
+  pcap_t *echo_pcap;
+  int echo_pcap_fd;
     
   char *pkt_output;
   char *snmp_output;
@@ -62,21 +93,31 @@ struct test_cfg {
   FILE *pkt_file;
   FILE *snmp_file;
   
-  int exact_num;
-  int wild_num;
   int flow_num;
   char *flow_type;
 
   uint16_t pkt_size;
   uint32_t duration;
   float data_rate; 
+  float probe_rate; 
   int finished;
 
-  pcap_t *pcap;
-  int pcap_fd;
 } obj_cfg;
 
 int my_read_objid(char *in_oid, oid *out_oid, size_t *out_oid_len);
+void generate_packet(int len);
+void send_data_raw_socket(int fd, int ix,  void *msg, int len);
+
+uint16_t Checksum(const uint16_t* buf, unsigned int nbytes) {
+  uint32_t sum = 0;
+  for (; nbytes > 1; nbytes -= 2) 
+    sum += *buf++;
+  if (nbytes == 1)
+    sum += *(unsigned char*) buf;
+  sum  = (sum >> 16) + (sum & 0xFFFF);
+  sum += (sum >> 16);
+  return ~sum;
+}
 
 int 
 load_cfg(struct test_cfg *test_cfg, const char *config) {
@@ -103,14 +144,6 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
       printf("server_ip:%lX\n",(long unsigned int) ntohl(test_cfg->server_ip));
     } else {
       printf("Failed to read server_ip\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.server_port");
-  if(elem != NULL) {
-    if((test_cfg->server_port = config_setting_get_int(elem)) == 0) {
-      printf("Failed to read server_port\n");
       exit(1);
     }
   }
@@ -159,10 +192,21 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
   elem = config_lookup(&conf, "switch_test_delay.data_dev");
   if(elem != NULL) {
     if((str_val = (char *)config_setting_get_string(elem)) != NULL) {
-      test_cfg->intf_name = malloc(strlen(str_val) + 1);
-      strcpy(test_cfg->intf_name, str_val);
+      test_cfg->data_dev_name = malloc(strlen(str_val) + 1);
+      strcpy(test_cfg->data_dev_name, str_val);
     } else {
       printf("Failed to read data interface\n");
+      exit(1);
+    }
+  }
+
+  elem = config_lookup(&conf, "switch_test_delay.echo_dev");
+  if(elem != NULL) {
+    if((str_val = (char *)config_setting_get_string(elem)) != NULL) {
+      test_cfg->echo_dev_name = malloc(strlen(str_val) + 1);
+      strcpy(test_cfg->echo_dev_name, str_val);
+    } else {
+      printf("Failed to read echo interface\n");
       exit(1);
     }
   }
@@ -181,22 +225,6 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
     if( ((str_val = (char *)config_setting_get_string(elem)) == NULL) || 
 	((test_cfg->snmp_file = fopen(str_val, "w")) == NULL) ) {
       perror("Failed to open snmp_output filename\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.exact_num");
-  if(elem != NULL) {
-    if((test_cfg->exact_num = config_setting_get_int(elem)) == 0) {
-      printf("Failed to read flow_num\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.wild_num");
-  if(elem != NULL) {
-    if((test_cfg->wild_num = config_setting_get_int(elem)) == 0) {
-      printf("Failed to read flow_num\n");
       exit(1);
     }
   }
@@ -236,9 +264,17 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
     }
   }
 
-  elem = config_lookup(&conf, "switch_test_delay.rate");
+  elem = config_lookup(&conf, "switch_test_delay.data_rate");
   if(elem != NULL) {
     if((test_cfg->data_rate = config_setting_get_int(elem)) == 0) {
+      printf("Failed to read data_rate\n");
+      exit(1);
+    }
+  }
+
+  elem = config_lookup(&conf, "switch_test_delay.probe_rate");
+  if(elem != NULL) {
+    if((test_cfg->probe_rate = config_setting_get_int(elem)) == 0) {
       printf("Failed to read data_rate\n");
       exit(1);
     }
@@ -285,13 +321,18 @@ destroy_cfg() {
   fclose(obj_cfg.snmp_file);
 
   //print pcap capture stats
-  if(pcap_stats(obj_cfg.pcap, &ps) < 0) {
-    printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.pcap));
+  if(pcap_stats(obj_cfg.data_pcap, &ps) < 0) {
+    printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.data_pcap));
+  } else {
+    printf("pcap stat : %u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+  }
+  if(pcap_stats(obj_cfg.echo_pcap, &ps) < 0) {
+    printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.data_pcap));
   } else {
     printf("pcap stat : %u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
   }
 
-  pcap_close(obj_cfg.pcap);
+  pcap_close(obj_cfg.data_pcap);
 };
 
 void
@@ -327,14 +368,8 @@ install_flows() {
     
     //set url
     addr.s_addr = obj_cfg.server_ip;
-
-     if (strcmp(obj_cfg.flow_type, "mix")== 0) {       
-       snprintf(msg, 1024, "https://%s/ws.v1/switch_delay_test/mixflows/exact/%d/wild/%d", (char *)inet_ntoa(addr), 
-	     obj_cfg.exact_num, obj_cfg.wild_num);
-     } else { 
-       snprintf(msg, 1024, "https://%s/ws.v1/switch_delay_test/installflows/%d/%s", (char *)inet_ntoa(addr), 
-	     obj_cfg.flow_num, obj_cfg.flow_type);
-     }
+    snprintf(msg, 1024, "https://%s/ws.v1/network_stack_test/installflows/%d", (char *)inet_ntoa(addr), 
+	     obj_cfg.flow_num);
     curl_easy_setopt(curl, CURLOPT_URL, msg);
     
     // this is an http get request
@@ -387,21 +422,137 @@ install_flows() {
 
 int
 init_pcap() {
+  struct nl_cache *cache;
+  //unsigned char mac_addr[ETH_ALEN];
+  struct ifreq ifr;
+  int s;
+  struct nl_sock *sk;        //the socket to talk to netlink
+  int ifindex;
+  struct rtnl_addr *addr;
+  struct nl_addr *local_addr;
+  uint32_t ip, i;
+  struct bpf_program fp;
+
+  //setup multiple ips on device data_dev_name
+  //initialiaze and connect the socket to the netlink socket
+  if((sk = nl_socket_alloc()) == NULL) {
+    perror("socket alloc");
+    exit(1);
+  }
+  if(nl_connect(sk, NETLINK_ROUTE) != 0) {
+    perror("nl connect");
+    exit(1);
+  }
+  
+  //looking the index of the bridge  
+  if ( (rtnl_link_alloc_cache(sk, &cache) ) != 0) {
+    perror("link alloc cache");
+    exit(1);
+  }
+  
+  if ( ( ifindex = rtnl_link_name2i(cache,  obj_cfg.data_dev_name) ) == 0) {
+    perror("Failed to translate interface name to int");
+    exit(1);
+  }
+  printf("Retrieving ix %d for intf %s\n", ifindex, obj_cfg.data_dev_name);
+  
+  s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s==-1) {
+    perror("Failed to open socket");
+    exit(1);
+  }
+  
+  ip = inet_addr("10.2.0.2");
+  for (i = 0; i < obj_cfg.flow_num; i++) {
+    // Allocate an empty address object to be filled out with the attributes
+    // of the new address.
+    addr = rtnl_addr_alloc();
+    if(addr == NULL) {
+      perror("addr alloc");
+      return 1;
+    }
+
+    // Fill out the mandatory attributes of the new address. Setting the
+    // local address will automatically set the address family and the
+    // prefix length to the correct values.
+    rtnl_addr_set_ifindex(addr, ifindex);
+    if((local_addr = nl_addr_build(AF_INET, &ip, 4)) == NULL) {
+      perror("addr parse");
+      exit(1);
+    }
+    ip = ntohl(ip);
+    ip += 4;
+    ip = htonl(ip);
+    nl_addr_set_prefixlen (local_addr, 30);
+    //    local_addr->a_prefixlen = 30;
+    char tmp[1024];
+    nl_addr2str (local_addr, tmp, 1024);
+    printf("setting ip %s on intf br0(%d)\n", tmp, ifindex);
+    if(rtnl_addr_set_local(addr, local_addr) != 0) {
+      perror("addr_set_local");
+      exit(1);
+    }
+    
+    // Build the netlink message and send it to the kernel, the operation will
+    // block until the operation has been completed. Alternatively the required
+    // netlink message can be built using rtnl_addr_build_add_request() to be
+    // sent out using nl_send_auto_complete().
+    int ret = rtnl_addr_add(sk, addr, 0);
+    if( (ret < 0) && ( abs(ret) != NLE_EXIST)) {
+      nl_perror(ret, "addr_set_local");
+      exit(1);
+    } 
+  }
+
   char errbuf[PCAP_ERRBUF_SIZE];
-  obj_cfg.pcap = pcap_open_live(obj_cfg.intf_name, 70, 1, 0, errbuf);
-  if(obj_cfg.pcap == NULL) {
+  obj_cfg.data_pcap = pcap_open_live(obj_cfg.data_dev_name, 80, 1, 0, errbuf);
+  if(obj_cfg.data_pcap == NULL) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);
   }
   
-  obj_cfg.pcap_fd = pcap_fileno(obj_cfg.pcap);
-  if(obj_cfg.pcap_fd < 0) {
-    printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.pcap));
+  obj_cfg.data_pcap_fd = pcap_fileno(obj_cfg.data_pcap);
+  if(obj_cfg.data_pcap_fd < 0) {
+    printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.data_pcap));
+    exit(1);
+  } 	 
+  if (pcap_compile(obj_cfg.data_pcap, &fp, "src port 7", 0, 0) == -1) {
+    fprintf(stderr, "Couldn't parse filter src port 7: %s\n", pcap_geterr(obj_cfg.data_pcap));
+    exit(2);
+  }	 
+  if (pcap_setfilter(obj_cfg.data_pcap, &fp) == -1) {
+    fprintf(stderr, "Couldn't install filter src port 7: %s\n", pcap_geterr(obj_cfg.data_pcap));
+    exit(2);
+  }
+
+  //set pcap fd in non blocking, so that I can select on it. 
+  if(pcap_setnonblock(obj_cfg.data_pcap, 0, errbuf) < -1) {
+    printf("pcap_open_live:%s\n", errbuf);
+    exit(1);    
+  }
+
+  obj_cfg.echo_pcap = pcap_open_live(obj_cfg.echo_dev_name, 80, 1, 0, errbuf);
+  if(obj_cfg.echo_pcap == NULL) {
+    printf("pcap_open_live:%s\n", errbuf);
+    exit(1);
+  } 
+  if (pcap_compile(obj_cfg.echo_pcap, &fp, "dst port 7", 0, 0) == -1) {
+    fprintf(stderr, "Couldn't parse filter dst port 7: %s\n", pcap_geterr(obj_cfg.echo_pcap));
+    exit(2);
+  }	 
+  if (pcap_setfilter(obj_cfg.echo_pcap, &fp) == -1) {
+    fprintf(stderr, "Couldn't install filter dst port 7: %s\n", pcap_geterr(obj_cfg.echo_pcap));
+    exit(2);
+  }
+  
+  obj_cfg.echo_pcap_fd = pcap_fileno(obj_cfg.echo_pcap);
+  if(obj_cfg.echo_pcap_fd < 0) {
+    printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.echo_pcap));
     exit(1);
   } 
   
   //set pcap fd in non blocking, so that I can select on it. 
-  if(pcap_setnonblock(obj_cfg.pcap, 0, errbuf) < -1) {
+  if(pcap_setnonblock(obj_cfg.echo_pcap, 0, errbuf) < -1) {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);    
   }
@@ -447,42 +598,85 @@ process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   struct nw_hdr *hdr = (struct nw_hdr *)malloc(sizeof(struct nw_hdr));
   char nw_src[20], nw_dst[20];
   struct pkt_state *state;
-
   bzero(hdr,sizeof(struct nw_hdr));
   if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr)) {
     state = malloc(sizeof(struct pkt_state));
     bzero(state,sizeof(struct pkt_state));
-    /* printf("%ld.%06ld;%ld.%06ld;%ld;%s\n",   */
+    /* printf("%ld.%06ld;%ld.%06ld;%ld.%06ld;%ld\n",   */
+    /* 	    (long int)ntohl(hdr->pktgen->echo_snd_tv_sec),   */
+    /* 	    (long int)ntohl(hdr->pktgen->echo_snd_tv_usec), */
+    /* 	    (long int)ntohl(hdr->pktgen->echo_rcv_tv_sec),   */
+    /* 	    (long int)ntohl(hdr->pktgen->echo_rcv_tv_usec), */
     /* 	    (long int)pkt_header->ts.tv_sec,   */
     /* 	    (long int)pkt_header->ts.tv_usec,  */
-    /* 	    (long int)ntohl(hdr->pktgen->tv_sec),   */
-    /* 	    (long int)ntohl(hdr->pktgen->tv_usec), */
-    /* 	    (long int) ntohl(hdr->pktgen->seq_num), */
-    /* 	    (char *)inet_ntoa(hdr->ip->daddr));   */
-
-    state->seq_num = ntohl(hdr->pktgen->seq_num);
-    state->rcv_ts.tv_sec = pkt_header->ts.tv_sec;
-    state->rcv_ts.tv_usec = pkt_header->ts.tv_usec;
-    state->snd_ts.tv_sec = ntohl(hdr->pktgen->tv_sec);
-    state->snd_ts.tv_usec = ntohl(hdr->pktgen->tv_usec);
+    /* 	    (long int)ntohl(hdr->pktgen->id));   */
+    state->seq_num = ntohl(hdr->pktgen->id);
+    state->data_rcv_ts.tv_sec = pkt_header->ts.tv_sec;
+    state->data_rcv_ts.tv_usec = pkt_header->ts.tv_usec;
+    state->data_snd_ts.tv_sec = ntohl(hdr->pktgen->echo_snd_tv_sec);
+    state->data_snd_ts.tv_usec = ntohl(hdr->pktgen->echo_snd_tv_usec);
+    state->echo_snd_ts.tv_sec = ntohl(hdr->pktgen->echo_rcv_tv_sec);
+    state->echo_snd_ts.tv_usec = ntohl(hdr->pktgen->echo_rcv_tv_usec);
     state->nw_dst = hdr->ip->daddr;
-    /* printf("%ld.%06ld;%ld.%06ld;%ld;%s\n",   */
-    /* 	    (long int)state->rcv_ts.tv_sec,   */
-    /* 	    (long int)state->rcv_ts.tv_usec,  */
-    /* 	    (long int)state->snd_ts.tv_sec,   */
-    /* 	    (long int)state->snd_ts.tv_usec, */
-    /* 	    (long int)state->seq_num, */
-    /* 	    (char *)inet_ntoa(state->nw_dst));   */
-
     TAILQ_INSERT_TAIL(&head, state, entries);
   }
+}
+
+void 
+generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
+  char nw_src[20], nw_dst[20], *msg, tmp_mac[ETH_ALEN];
+  struct pkt_state *state;
+  struct ether_header *ether;
+  struct iphdr *ip;
+  struct udphdr *udp;
+  struct  pktgen_hdr *pktgen;
+  uint32_t tmp_ip;
+  uint16_t tmp_port;
+
+  msg = malloc(pkt_header->len);
+  memcpy(msg, pkt_data, pkt_header->caplen);
+
+  ether = (struct ether_header *)msg;
+  ip = (struct iphdr *)(msg + ETHER_HDR_LEN);
+  udp = (struct udphdr *)(msg + ETHER_HDR_LEN + sizeof(struct iphdr)); 
+  pktgen = (struct pktgen_hdr *)(msg + ETHER_HDR_LEN + sizeof(struct iphdr) + sizeof(struct udphdr)); 
+
+  if((ether->ether_type != htons(ETHERTYPE_IP)) ||
+     (ip->protocol != IPPROTO_UDP) ||
+     (udp->dest != htons(7))) {
+	printf("Invalid packet\n");
+    return;
+  }
+  //revert mac address
+  memcpy(tmp_mac, ether->ether_shost, ETH_ALEN); 
+  memcpy(ether->ether_shost, ether->ether_dhost, ETH_ALEN); 
+  memcpy(ether->ether_dhost, tmp_mac, ETH_ALEN); 
+  
+  //revert ip addr
+  tmp_ip = ip->saddr;
+  ip->saddr = ip->daddr;
+  ip->daddr = tmp_ip;
+  ip->check =  0;
+  ip->check =  Checksum((uint16_t *)ip, 20);
+  
+  //revert ip address
+  tmp_port = udp->source; 
+  udp->source = udp->dest; 
+  udp->dest = tmp_port;
+
+  //append timestamp
+  pktgen->echo_rcv_tv_sec = htonl(pkt_header->ts.tv_sec);
+  pktgen->echo_rcv_tv_usec = htonl(pkt_header->ts.tv_usec);
+  //  printf("%ld:%06ld packet received pkt %ld\n",ntohl(pktgen->echo_rcv_tv_sec), 
+  // ntohl(pktgen->echo_rcv_tv_usec), (long int) ntohl(pktgen->id)); 
+  send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
 }
 
 void
 get_snmp_status(struct timeval *ts) {
   netsnmp_session *ss;    
   netsnmp_pdu *pdu;
-  netsnmp_pdu *response;
+ netsnmp_pdu *response;
   int status, count;
   netsnmp_variable_list *vars;
 
@@ -508,15 +702,15 @@ get_snmp_status(struct timeval *ts) {
 	char *sp = (char *)malloc(1 + vars->val_len);
 	memcpy(sp, vars->val.string, vars->val_len);
 	sp[vars->val_len] = '\0';
-	fprintf(obj_cfg.snmp_file, "%ld.%06ld cpu 1 %s\n", ts->tv_sec, ts->tv_usec,sp);
+	fprintf(obj_cfg.snmp_file, "%ld.%06ld;cpu;1;%s\n", ts->tv_sec, ts->tv_usec,sp);
 	free(sp);
       } else if ((vars->type == ASN_INTEGER)  || (vars->type == 0x41)) {
 	if( memcmp(vars->name, obj_cfg.pkt_in_OID, obj_cfg.pkt_in_OID_len*sizeof(int)) == 0) 
-	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_in;1;%lu\n", ts->tv_sec, ts->tv_usec, 
+	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_in;1;%ld\n", ts->tv_sec, ts->tv_usec, 
 		  *vars->val.integer);
 	
 	if( memcmp(vars->name, obj_cfg.pkt_out_OID, obj_cfg.pkt_out_OID_len*sizeof(int)) == 0) 
-	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_out;1;%lu\n", ts->tv_sec, ts->tv_usec, 
+	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_out;1;%ld\n", ts->tv_sec, ts->tv_usec, 
 		  *vars->val.integer);
 	
       } else 
@@ -546,7 +740,8 @@ packet_capture( void *ptr ) {
   while(!obj_cfg.finished) {       
     /* Initialize the file descriptor set. */
     FD_ZERO (&set);
-    FD_SET(obj_cfg.pcap_fd, &set);
+    FD_SET(obj_cfg.data_pcap_fd, &set);
+    FD_SET(obj_cfg.echo_pcap_fd, &set);
     gettimeofday(&now, NULL);
 
     /* Initialize the timeout data structure. */
@@ -578,19 +773,74 @@ packet_capture( void *ptr ) {
       printf("send snmp %ld\n", last_snmp.tv_sec);
     } else {
        /* Service all the sockets with input pending. */
-      if (FD_ISSET(obj_cfg.pcap_fd, &set))  {
-	if(pcap_next_ex(obj_cfg.pcap, &pkt_header,
+      if (FD_ISSET(obj_cfg.data_pcap_fd, &set))  {
+	if(pcap_next_ex(obj_cfg.data_pcap, &pkt_header,
 			&pkt_data) < 0) {
 	  perror("pcap_next_en");
 	  exit(1);
 	}
 	process_pcap_pkt(pkt_data, pkt_header);
+      } else if (FD_ISSET(obj_cfg.echo_pcap_fd, &set))  {
+	if(pcap_next_ex(obj_cfg.echo_pcap, &pkt_header,
+			&pkt_data) < 0) {
+	  perror("pcap_generate_reply");
+	  exit(1);
+	}
+	generate_reply(pkt_data, pkt_header);
       }
     }
   };
   printf("this is the packet capturer\n");
 };
 
+uint32_t
+timediff(struct timeval *now, struct timeval *last_pkt) {
+  return (now->tv_sec - last_pkt->tv_sec) * 1000000 +
+    (now->tv_usec - last_pkt->tv_usec);
+}
+
+void *
+echo_generate( void *ptr ) {
+  char intf_file[1024], msg[1024];
+  FILE *file;
+  int i;
+  struct timeval now, last_pkt, start;
+  uint32_t delay; //time between consecutive pkts in microsec
+
+  gettimeofday(&start, NULL);
+  gettimeofday(&last_pkt, NULL);
+  
+  delay = (uint32_t)((8*obj_cfg.pkt_size)/(obj_cfg.data_rate));
+
+  while (1) {
+    pthread_yield();
+    gettimeofday(&now, NULL);    
+    if(timediff(&now, &last_pkt) >= delay ) {
+      /* printf("delay : %ld, now : %ld.%06ld, last : %ld.%06ld diff %ld\n", (long int)delay, now.tv_sec,  */
+      /* 	     now.tv_usec, last_pkt.tv_sec, last_pkt.tv_usec, (long int)timediff(&now, &last_pkt));  */
+      generate_packet(obj_cfg.pkt_size);
+      last_pkt.tv_usec += delay%1000000;
+      if(last_pkt.tv_usec >= 1000000) {
+	last_pkt.tv_usec -= 1000000;
+	last_pkt.tv_sec++;
+      }
+      last_pkt.tv_sec += (uint32_t)(delay/1000000);
+    } else if (timediff(&now, &start) >= obj_cfg.duration*1000000) {
+      break;
+    }
+
+    //if(pkt_count >= 1) break;
+  }
+
+  while(timediff(&now, &last_pkt) < 1800) {
+    pthread_yield();
+    gettimeofday(&now, NULL);       
+  }
+  
+
+  obj_cfg.finished = 1;
+  return;
+}
 
 int 
 printf_and_check(char *filename, char *msg) {
@@ -611,18 +861,17 @@ printf_and_check(char *filename, char *msg) {
 }
 
 void *
-packet_generate( void *ptr ) {
-  struct timeval start, now;
+data_generate( void *ptr ) {
   char intf_file[1024], msg[1024];
   FILE *file;
   struct in_addr addr;
 
   printf_and_check("/proc/net/pktgen/kpktgend_0",  "rem_device_all");
 
-  snprintf(msg, 1024, "add_device %s", obj_cfg.intf_name);
+  snprintf(msg, 1024, "add_device %s", obj_cfg.data_dev_name);
   printf_and_check("/proc/net/pktgen/kpktgend_0",msg );
 
-  snprintf(intf_file, 1024, "/proc/net/pktgen/%s",obj_cfg.intf_name);
+  snprintf(intf_file, 1024, "/proc/net/pktgen/%s",obj_cfg.data_dev_name);
   printf_and_check(intf_file, "clone_skb 0");
   uint32_t delay = (uint32_t)((8*obj_cfg.pkt_size*1000)/(obj_cfg.data_rate));
   snprintf(msg, 1024, "delay %lu", (long unsigned int)delay);
@@ -635,21 +884,7 @@ packet_generate( void *ptr ) {
   printf_and_check(intf_file, msg);
   snprintf(msg, 1024, "pkt_size %d", obj_cfg.pkt_size);
   printf_and_check(intf_file, msg);
-
-/*   if(strcmp(obj_cfg.flow_type, "wildcard") == 0) { */
-/*     printf_and_check(intf_file,  "dst_min 10.3.0.0"); */
-/*     addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + ((obj_cfg.flow_num) << 8) - 1); */
-/*   } else if (strcmp(obj_cfg.flow_type, "exact")== 0) { */
-    printf_and_check(intf_file,  "dst_min 10.3.0.0");
-    addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + (obj_cfg.flow_num));
-/*   } else if (strcmp(obj_cfg.flow_type, "mix")== 0) { */
-/*     printf_and_check(intf_file,  "dst_min 10.3.0.0"); */
-/*     addr.s_addr = htonl(ntohl(inet_addr("10.3.0.0")) + obj_cfg.exact_num + (obj_cfg.wild_num*256)); */
-/*   }  */
-/*   else  { */
-/*     printf("Invalid flow type\n"); */
-/*     exit(1); */
-/*   } */
+  printf_and_check(intf_file,  "dst_min 10.2.0.6");
   snprintf(msg, 1024, "dst_max %s", (char *)inet_ntoa(addr)); 
   printf_and_check(intf_file, msg);
   printf_and_check(intf_file,"flag IPDST_RND");
@@ -660,8 +895,8 @@ packet_generate( void *ptr ) {
   printf_and_check(intf_file, "vlan_cfi 0"); 
   printf_and_check(intf_file, "dst_mac 10:20:30:40:50:60");
   printf_and_check(intf_file, "src_mac 10:20:30:40:50:61");
-  printf_and_check(intf_file, "src_min 10.2.0.1");
-  printf_and_check(intf_file, "src_max 10.2.0.1");
+  printf_and_check(intf_file, "src_min 10.2.0.2");
+  printf_and_check(intf_file, "src_max 10.2.0.2");
   printf_and_check(intf_file, "tos 0");
   printf_and_check(intf_file, "udp_src_max 8080");
   printf_and_check(intf_file, "udp_src_min 8080");
@@ -679,11 +914,13 @@ process_data() {
   struct pkt_state *state;
   while (head.tqh_first != NULL) {
     state = head.tqh_first;
-    fprintf(obj_cfg.pkt_file, "%ld.%06ld %ld.%06ld %ld %s\n",  
-	    (long int)state->rcv_ts.tv_sec,  
-	    (long int)state->rcv_ts.tv_usec, 
-	    (long int)state->snd_ts.tv_sec,  
-	    (long int)state->snd_ts.tv_usec,
+    fprintf(obj_cfg.pkt_file, "%ld.%06ld;%ld.%06ld;%ld.%06ld;%ld;%s\n",  
+	    (long int)state->data_snd_ts.tv_sec,  
+	    (long int)state->data_snd_ts.tv_usec,
+	    (long int)state->echo_snd_ts.tv_sec,  
+	    (long int)state->echo_snd_ts.tv_usec,
+	    (long int)state->data_rcv_ts.tv_sec,  
+	    (long int)state->data_rcv_ts.tv_usec, 
 	    (long int)state->seq_num,
 	    (char *)inet_ntoa(state->nw_dst));  
     TAILQ_REMOVE(&head, head.tqh_first, entries);
@@ -715,9 +952,134 @@ initialize_snmp() {
   obj_cfg.session.community_len = strlen(obj_cfg.snmp_community);
 }
 
+uint16_t id=0x1140;
+
+void 
+generate_packet(int len) {
+  struct ether_header *ether;
+  struct iphdr *ip;
+  struct udphdr *udp;
+  struct pktgen_hdr *pktgen;
+  struct timeval now;
+
+  uint32_t src_ip = ntohl(inet_addr("10.2.0.0")) + ((rand()%(obj_cfg.flow_num + 1)) << 2) + 2;
+  //  uint32_t dst_ip = ntohl(inet_addr("10.3.0.0")) + (rand()%65533) + 4;
+  uint16_t dest =  (rand()%1024) + 4;
+  uint32_t dst_ip = ntohl(inet_addr("10.3.0.0")) + dest;
+
+  ether = (struct ether_header *)pkt_buf;
+  memcpy(ether->ether_shost, "\x00\x0a\x5e\x54\x2c\xc0", ETH_ALEN); 
+  memcpy(ether->ether_dhost, "\x90\xe6\xba\x20\xb2\xbb", ETH_ALEN); 
+  ether->ether_type = htons(ETHERTYPE_IP);
+
+  ip = (struct iphdr *)(pkt_buf + ETHER_HDR_LEN);
+  bzero(ip, sizeof(struct iphdr));
+  ip->ihl = 5;
+  ip->version = 4;
+  ip->ttl = 0x40;
+  //  ip->id = htons(id++);
+  ip->protocol = IPPROTO_UDP;
+  ip->tot_len = htons(len - ETHER_HDR_LEN );
+  ip->saddr =  htonl(src_ip);
+  ip->daddr = htonl(dst_ip);
+  ip->check =  Checksum((uint16_t *)ip, 20);
+  
+  udp = (struct udphdr *)(pkt_buf + ETHER_HDR_LEN + sizeof(struct iphdr));
+  //udp->source = htons((rand()%60000) + 5000 );
+  udp->source = htons(10000 + dest);
+  udp->dest =  htons(7);
+  udp->len = htons(len -  ETHER_HDR_LEN - sizeof(struct iphdr));
+  udp->check = 0; //htons(0x4a77);
+
+  pktgen = (struct pktgen_hdr *)(pkt_buf + ETHER_HDR_LEN + sizeof(struct iphdr) 
+			     + sizeof(struct udphdr));
+  pktgen->id = htonl(++pkt_count);
+  gettimeofday(&now, NULL);
+  pktgen->echo_snd_tv_sec = htonl(now.tv_sec);
+  pktgen->echo_snd_tv_usec = htonl(now.tv_usec);
+  
+  if(pkt_count % 1000000 == 0)
+    printf("seding packet %d\n", pkt_count);
+
+  send_data_raw_socket(obj_cfg.data_dev_fd, obj_cfg.data_dev_ix, pkt_buf, len);
+}
+
+void 
+send_data_raw_socket(int fd, int ix, void *msg, int len) {
+  struct sockaddr_ll socket_address;
+  int ret;
+  
+  bzero(&socket_address, sizeof(socket_address));
+  socket_address.sll_family   = PF_PACKET;
+  socket_address.sll_protocol = htons(ETH_P_ALL);
+  socket_address.sll_ifindex  = ix;
+  socket_address.sll_hatype   = ARPHRD_ETHER; 
+  socket_address.sll_halen    = ETH_ALEN;
+  socket_address.sll_pkttype  = PACKET_OTHERHOST;
+  
+  /*queue the packet*/
+  ret = write(fd, msg, len);
+	
+  if ( ret < 0 && errno != ENOBUFS ) {
+    fprintf(stderr, "sending of data failed\n");
+  }
+}
+
+
+void 
+initialize_raw_socket() {
+  struct ifreq ifr;
+  struct sockaddr_ll saddrll;
+  struct channel_info * ch_info;
+  
+  obj_cfg.data_dev_fd = socket(AF_PACKET,SOCK_RAW, htons(ETH_P_ALL));
+  if( obj_cfg.data_dev_fd == -1) {
+    perror("raw socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))");
+    exit(1);
+  }
+  
+  // bind to a specific port
+  strncpy(ifr.ifr_name, obj_cfg.data_dev_name,IFNAMSIZ);
+  if( ioctl(obj_cfg.data_dev_fd, SIOCGIFINDEX, &ifr)  == -1 ) {
+    perror("ioctl()");
+    exit(1);
+  }
+  obj_cfg.data_dev_ix = ifr.ifr_ifindex;
+  memset(&saddrll, 0, sizeof(saddrll));
+  saddrll.sll_family = AF_PACKET;
+  saddrll.sll_protocol = ETH_P_ALL;
+  saddrll.sll_ifindex = ifr.ifr_ifindex;
+  if ( bind(obj_cfg.data_dev_fd, (struct sockaddr *) &saddrll, sizeof(struct sockaddr_ll)) == -1 ) {
+    perror("bind()");
+    exit(1);
+  }
+
+  obj_cfg.echo_dev_fd = socket(AF_PACKET,SOCK_RAW, htons(ETH_P_ALL));
+  if( obj_cfg.echo_dev_fd == -1) {
+    perror("raw socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))");
+    exit(1);
+  }
+  
+  // bind to a specific port
+  strncpy(ifr.ifr_name, obj_cfg.echo_dev_name,IFNAMSIZ);
+  if( ioctl(obj_cfg.echo_dev_fd, SIOCGIFINDEX, &ifr)  == -1 ) {
+    perror("ioctl()");
+    exit(1);
+  }
+  obj_cfg.echo_dev_ix = ifr.ifr_ifindex;
+  memset(&saddrll, 0, sizeof(saddrll));
+  saddrll.sll_family = AF_PACKET;
+  saddrll.sll_protocol = ETH_P_ALL;
+  saddrll.sll_ifindex = ifr.ifr_ifindex;
+  if ( bind(obj_cfg.echo_dev_fd, (struct sockaddr *) &saddrll, sizeof(struct sockaddr_ll)) == -1 ) {
+    perror("bind()");
+    exit(1);
+  }
+}
+
 int 
 main(int argc, char **argv) {
-  pthread_t thrd_capture, thrd_generate;
+  pthread_t thrd_capture, thrd_echo, thrd_data;
 
   if(argc < 1) {
     printf("Forgot to set the configuration file name\n");
@@ -732,18 +1094,22 @@ main(int argc, char **argv) {
     exit(1);
   }
 
-  initialize_snmp();
+  initialize_raw_socket();
   init_pcap();
   install_flows();
+  initialize_snmp();
 
-  if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) ||
-      (pthread_create( &thrd_generate, NULL, packet_generate, NULL))) {
+  if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) 
+      || (pthread_create( &thrd_echo, NULL, echo_generate, NULL)) 
+      //|| (pthread_create( &thrd_data, NULL, data_generate, NULL)) 
+      ) {
     perror("pthread_create");
     exit(1);
   }
 
   pthread_join(thrd_capture, NULL);
-  pthread_join(thrd_generate, NULL); 
+  pthread_join(thrd_echo, NULL); 
+  //pthread_join(thrd_data, NULL); 
 
   process_data();
   destroy_cfg();

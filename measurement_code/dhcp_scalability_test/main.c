@@ -26,7 +26,7 @@
 
 #include "dhcp.h"
 
-#define DHCP_DISCOVERY_DELAY 10000
+#define DHCP_DISCOVERY_DELAY 150
 
 uint8_t pkt_buf[3000];
 uint32_t pkt_count = 0;
@@ -87,6 +87,12 @@ int my_read_objid(char *in_oid, oid *out_oid, size_t *out_oid_len);
 void send_data_raw_socket(int fd, int ix,  void *msg, int len);
 void send_dhcp_discovery(uint8_t *mac_addr, uint32_t xid, uint8_t dhcp_msg_type,
 		    char *hostname, uint32_t request_ip, uint32_t server_ip);
+
+uint32_t
+timediff(struct timeval *now, struct timeval *last_pkt) {
+  return (now->tv_sec - last_pkt->tv_sec) * 1000000 +
+    (now->tv_usec - last_pkt->tv_usec);
+}
 
 uint16_t Checksum(const uint16_t* buf, unsigned int nbytes) {
   uint32_t sum = 0;
@@ -537,16 +543,17 @@ dhcp_discovery_thread( void *ptr ) {
   int32_t i;
   struct pkt_state *state;
   struct timeval now, prev;
+  uint32_t id = 0x223311;
 
   for( i = 0; i < obj_cfg.flow_num;i++) {
     mac_addr[5] = i;
     state = malloc(sizeof(struct pkt_state));
     bzero(state,sizeof(struct pkt_state));
     memcpy(state->addr, mac_addr, 6);
-    gettimeofday(&state->start_ts, NULL);
     TAILQ_INSERT_TAIL(&head, state, entries);
-    send_dhcp_discovery(mac_addr, 0x223311,  DHCPDISCOVER, "hello", 0 ,0 );
+    send_dhcp_discovery(mac_addr, id++,  DHCPDISCOVER, "hello", 0 ,0 );
     gettimeofday(&prev, NULL);
+    gettimeofday(&state->start_ts, NULL);
     gettimeofday(&now, NULL); 
     while(timediff(&now, &prev) < DHCP_DISCOVERY_DELAY) {
       gettimeofday(&now, NULL);
@@ -618,12 +625,6 @@ packet_capture( void *ptr ) {
   printf("this is the packet capturer\n");
 };
 
-uint32_t
-timediff(struct timeval *now, struct timeval *last_pkt) {
-  return (now->tv_sec - last_pkt->tv_sec) * 1000000 +
-    (now->tv_usec - last_pkt->tv_usec);
-}
-
 int 
 printf_and_check(char *filename, char *msg) {
   FILE *ctrl = fopen(filename, "w");
@@ -647,7 +648,7 @@ process_data() {
   struct pkt_state *state;
   while (head.tqh_first != NULL) {
     state = head.tqh_first;
-    fprintf(obj_cfg.pkt_file, "%02x:%02x:%02x:%02x:%02x:%02x;%ld.%06ld;%ld.%06ld;%ld.%06ld;%s\n",   
+    fprintf(obj_cfg.pkt_file, "%02x:%02x:%02x:%02x:%02x:%02x %ld.%06ld %ld.%06ld %ld.%06ld %s\n",   
         state->addr[0],state->addr[1],state->addr[2],state->addr[3],state->addr[4],state->addr[5],
         (long int)state->start_ts.tv_sec,   
         (long int)state->start_ts.tv_usec,  
@@ -707,10 +708,7 @@ send_data_raw_socket(int fd, int ix, void *msg, int len) {
   if ( ret < 0 && errno == ENOBUFS ) {
     printf(stderr, "buffer fulll!\n");
   }
-
-
 }
-
 
 void 
 initialize_raw_socket() {
