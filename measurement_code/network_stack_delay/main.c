@@ -72,6 +72,9 @@ struct test_cfg {
   size_t cpu_OID_len;
   size_t pkt_in_OID_len;
   size_t pkt_out_OID_len;
+
+  uint8_t local_mac[6];
+  uint8_t remote_mac[6];
   char *snmp_community;
   netsnmp_session session;
 
@@ -81,11 +84,6 @@ struct test_cfg {
   int data_dev_ix;
   pcap_t *data_pcap;
   int data_pcap_fd;
-  char *echo_dev_name;
-  int echo_dev_fd;
-  int echo_dev_ix;
-  pcap_t *echo_pcap;
-  int echo_pcap_fd;
     
   char *pkt_output;
   char *snmp_output;
@@ -196,17 +194,6 @@ load_cfg(struct test_cfg *test_cfg, const char *config) {
       strcpy(test_cfg->data_dev_name, str_val);
     } else {
       printf("Failed to read data interface\n");
-      exit(1);
-    }
-  }
-
-  elem = config_lookup(&conf, "switch_test_delay.echo_dev");
-  if(elem != NULL) {
-    if((str_val = (char *)config_setting_get_string(elem)) != NULL) {
-      test_cfg->echo_dev_name = malloc(strlen(str_val) + 1);
-      strcpy(test_cfg->echo_dev_name, str_val);
-    } else {
-      printf("Failed to read echo interface\n");
       exit(1);
     }
   }
@@ -363,8 +350,11 @@ install_flows() {
     
     //set url
     addr.s_addr = obj_cfg.server_ip;
-    snprintf(msg, 1024, "https://%s/ws.v1/network_stack_test/installflows/%d", (char *)inet_ntoa(addr), 
-	     obj_cfg.flow_num);
+    snprintf(msg, 1024, "https://%s/ws.v1/network_stack_test/installflows/%d/%02x:%02x:%02x:%02x:%02x:%02x", 
+	     (char *)inet_ntoa(addr), 
+	     obj_cfg.flow_num, (uint8_t)obj_cfg.local_mac[0], (uint8_t)obj_cfg.local_mac[1], 
+	     (uint8_t)obj_cfg.local_mac[2], (uint8_t)obj_cfg.local_mac[3], 
+	     (uint8_t)obj_cfg.local_mac[4], (uint8_t)obj_cfg.local_mac[5]);
     curl_easy_setopt(curl, CURLOPT_URL, msg);
     
     // this is an http get request
@@ -385,6 +375,8 @@ install_flows() {
 	exit(1);
       }
 
+      printf("%s\n", curl_buf);
+
       //load json data to a json parser
       error = NULL;
       json_parser_load_from_data(parser, curl_buf, curl_buf_len, &error);
@@ -401,7 +393,20 @@ install_flows() {
       JsonReader *reader = json_reader_new(root);
 
       json_reader_read_member (reader, "result");
-      success = json_reader_get_int_value (reader);  
+      success = json_reader_get_int_value (reader); 
+      json_reader_end_element (reader); 
+
+      reader = json_reader_new(root);
+      if(success) {
+	json_reader_read_member (reader, "bridge_mac");
+	char *bridge_mac = json_reader_get_string_value(reader);
+	printf("received mac : %s\n", bridge_mac);
+
+/* 	sscanf(bridge_mac, "%02x:%02x:%02x:%02x:%02x:%02x", (uint8_t *)&obj_cfg.remote_mac[0],  */
+/* 	       (uint8_t *)&obj_cfg.remote_mac[1], (uint8_t *)&obj_cfg.remote_mac[2],  */
+/* 	       (uint8_t *)&obj_cfg.remote_mac[3], (uint8_t *)&obj_cfg.remote_mac[4],  */
+/* 	       (uint8_t *)&obj_cfg.remote_mac[5]); */
+      }
       json_reader_end_element (reader);
       printf("result:%d\n", success);
 
@@ -511,12 +516,20 @@ init_pcap() {
     printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.data_pcap));
     exit(1);
   } 	 
-  if (pcap_compile(obj_cfg.data_pcap, &fp, "src port 7", 0, 0) == -1) {
-    fprintf(stderr, "Couldn't parse filter src port 7: %s\n", pcap_geterr(obj_cfg.data_pcap));
+
+  char pcap_filter[1024];
+  sprintf(pcap_filter, "ether src host %02x:%02x:%02x:%02x:%02x:%02x", obj_cfg.remote_mac[0], 
+	  obj_cfg.remote_mac[1], obj_cfg.remote_mac[2], 
+	  obj_cfg.remote_mac[3], obj_cfg.remote_mac[4], 
+	  obj_cfg.remote_mac[5]);
+
+  printf("pcap filter %s\n", pcap_filter);
+  if (pcap_compile(obj_cfg.data_pcap, &fp, pcap_filter, 0, 0) == -1) {
+    fprintf(stderr, "Couldn't parse filter %s: %s\n", pcap_filter, pcap_geterr(obj_cfg.data_pcap));
     exit(2);
   }	 
   if (pcap_setfilter(obj_cfg.data_pcap, &fp) == -1) {
-    fprintf(stderr, "Couldn't install filter src port 7: %s\n", pcap_geterr(obj_cfg.data_pcap));
+    fprintf(stderr, "Couldn't install filter %s: %s\n",pcap_filter, pcap_geterr(obj_cfg.data_pcap));
     exit(2);
   }
 
@@ -526,31 +539,6 @@ init_pcap() {
     exit(1);    
   }
 
-  obj_cfg.echo_pcap = pcap_open_live(obj_cfg.echo_dev_name, 80, 1, 0, errbuf);
-  if(obj_cfg.echo_pcap == NULL) {
-    printf("pcap_open_live:%s\n", errbuf);
-    exit(1);
-  } 
-  if (pcap_compile(obj_cfg.echo_pcap, &fp, "dst port 7", 0, 0) == -1) {
-    fprintf(stderr, "Couldn't parse filter dst port 7: %s\n", pcap_geterr(obj_cfg.echo_pcap));
-    exit(2);
-  }	 
-  if (pcap_setfilter(obj_cfg.echo_pcap, &fp) == -1) {
-    fprintf(stderr, "Couldn't install filter dst port 7: %s\n", pcap_geterr(obj_cfg.echo_pcap));
-    exit(2);
-  }
-  
-  obj_cfg.echo_pcap_fd = pcap_fileno(obj_cfg.echo_pcap);
-  if(obj_cfg.echo_pcap_fd < 0) {
-    printf("pcap_fileno:%s\n", pcap_geterr(obj_cfg.echo_pcap));
-    exit(1);
-  } 
-  
-  //set pcap fd in non blocking, so that I can select on it. 
-  if(pcap_setnonblock(obj_cfg.echo_pcap, 0, errbuf) < -1) {
-    printf("pcap_open_live:%s\n", errbuf);
-    exit(1);    
-  }
 
   //init in memory packet storage
   TAILQ_INIT(&head);     
@@ -664,7 +652,7 @@ generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   pktgen->echo_rcv_tv_usec = htonl(pkt_header->ts.tv_usec);
   //  printf("%ld:%06ld packet received pkt %ld\n",ntohl(pktgen->echo_rcv_tv_sec), 
   // ntohl(pktgen->echo_rcv_tv_usec), (long int) ntohl(pktgen->id)); 
-  send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
+  //send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
 }
 
 void
@@ -736,7 +724,6 @@ packet_capture( void *ptr ) {
     /* Initialize the file descriptor set. */
     FD_ZERO (&set);
     FD_SET(obj_cfg.data_pcap_fd, &set);
-    FD_SET(obj_cfg.echo_pcap_fd, &set);
     gettimeofday(&now, NULL);
 
     /* Initialize the timeout data structure. */
@@ -775,14 +762,14 @@ packet_capture( void *ptr ) {
 	  exit(1);
 	}
 	process_pcap_pkt(pkt_data, pkt_header);
-      } else if (FD_ISSET(obj_cfg.echo_pcap_fd, &set))  {
-	if(pcap_next_ex(obj_cfg.echo_pcap, &pkt_header,
-			&pkt_data) < 0) {
-	  perror("pcap_generate_reply");
-	  exit(1);
-	}
-	generate_reply(pkt_data, pkt_header);
-      }
+/*       } else if (FD_ISSET(obj_cfg.echo_pcap_fd, &set))  { */
+/* 	if(pcap_next_ex(obj_cfg.echo_pcap, &pkt_header, */
+/* 			&pkt_data) < 0) { */
+/* 	  perror("pcap_generate_reply"); */
+/* 	  exit(1); */
+/* 	} */
+/* 	generate_reply(pkt_data, pkt_header); */
+      } 
     }
   };
   printf("this is the packet capturer\n");
@@ -805,12 +792,14 @@ echo_generate( void *ptr ) {
   gettimeofday(&start, NULL);
   gettimeofday(&last_pkt, NULL);
   
-  delay = (uint32_t)((8*obj_cfg.pkt_size*1000)/(obj_cfg.data_rate));
+  delay = (uint32_t)((8*obj_cfg.pkt_size)/(obj_cfg.data_rate));
 
   while (1) {
     pthread_yield();
     gettimeofday(&now, NULL);    
-    if(timediff(&now, &last_pkt) >= delay ) {
+    if (timediff(&now, &start) >= obj_cfg.duration*1000000) {
+      break;
+    } else if(timediff(&now, &last_pkt) >= delay ) {
       /* printf("delay : %ld, now : %ld.%06ld, last : %ld.%06ld diff %ld\n", (long int)delay, now.tv_sec,  */
       /* 	     now.tv_usec, last_pkt.tv_sec, last_pkt.tv_usec, (long int)timediff(&now, &last_pkt));  */
       generate_packet(obj_cfg.pkt_size);
@@ -820,12 +809,16 @@ echo_generate( void *ptr ) {
 	last_pkt.tv_sec++;
       }
       last_pkt.tv_sec += (uint32_t)(delay/1000000);
-    } else if (timediff(&now, &start) >= obj_cfg.duration*1000000) {
-      break;
-    }
+    } 
 
     //if(pkt_count >= 1) break;
   }
+
+/*   while(timediff(&now, &last_pkt) < 1800) { */
+/*     pthread_yield(); */
+/*     gettimeofday(&now, NULL);        */
+/*   } */
+  
 
   obj_cfg.finished = 1;
   return;
@@ -849,65 +842,14 @@ printf_and_check(char *filename, char *msg) {
   return 1;
 }
 
-void *
-data_generate( void *ptr ) {
-  char intf_file[1024], msg[1024];
-  FILE *file;
-  struct in_addr addr;
-
-  printf_and_check("/proc/net/pktgen/kpktgend_0",  "rem_device_all");
-
-  snprintf(msg, 1024, "add_device %s", obj_cfg.data_dev_name);
-  printf_and_check("/proc/net/pktgen/kpktgend_0",msg );
-
-  snprintf(intf_file, 1024, "/proc/net/pktgen/%s",obj_cfg.data_dev_name);
-  printf_and_check(intf_file, "clone_skb 0");
-  uint32_t delay = (uint32_t)((8*obj_cfg.pkt_size*1000)/(obj_cfg.data_rate));
-  snprintf(msg, 1024, "delay %lu", (long unsigned int)delay);
-  printf("delay %lu\n", (long unsigned int)delay);
-  printf_and_check(intf_file, msg);
-  snprintf(msg, 1024, "count %lu", 
-	   (long unsigned int)(obj_cfg.duration*(1000000000/delay)));
-  printf("duration %d delay %d count %lu\n", obj_cfg.duration, delay,
-	 (long unsigned int)(obj_cfg.duration*(1000000000/delay)));
-  printf_and_check(intf_file, msg);
-  snprintf(msg, 1024, "pkt_size %d", obj_cfg.pkt_size);
-  printf_and_check(intf_file, msg);
-  printf_and_check(intf_file,  "dst_min 10.2.0.6");
-  snprintf(msg, 1024, "dst_max %s", (char *)inet_ntoa(addr)); 
-  printf_and_check(intf_file, msg);
-  printf_and_check(intf_file,"flag IPDST_RND");
-
-  snprintf(msg, 1024, "vlan_id %ld", (long int)0xffff);
-  printf_and_check(intf_file, msg);
-  printf_and_check(intf_file, "vlan_p 0"); 
-  printf_and_check(intf_file, "vlan_cfi 0"); 
-  printf_and_check(intf_file, "dst_mac 10:20:30:40:50:60");
-  printf_and_check(intf_file, "src_mac 10:20:30:40:50:61");
-  printf_and_check(intf_file, "src_min 10.2.0.2");
-  printf_and_check(intf_file, "src_max 10.2.0.2");
-  printf_and_check(intf_file, "tos 0");
-  printf_and_check(intf_file, "udp_src_max 8080");
-  printf_and_check(intf_file, "udp_src_min 8080");
-  printf_and_check(intf_file, "udp_dst_max 8080");
-  printf_and_check(intf_file, "udp_dst_min 8080");
-
-  //start packet generation
-  printf_and_check("/proc/net/pktgen/pgctrl", "start");
-
-  obj_cfg.finished = 1;
-};
-
 void
 process_data() {
   struct pkt_state *state;
   while (head.tqh_first != NULL) {
     state = head.tqh_first;
-    fprintf(obj_cfg.pkt_file, "%ld.%06ld;%ld.%06ld;%ld.%06ld;%ld;%s\n",  
+    fprintf(obj_cfg.pkt_file, "%ld.%06ld %ld.%06ld %ld %s\n",  
 	    (long int)state->data_snd_ts.tv_sec,  
 	    (long int)state->data_snd_ts.tv_usec,
-	    (long int)state->echo_snd_ts.tv_sec,  
-	    (long int)state->echo_snd_ts.tv_usec,
 	    (long int)state->data_rcv_ts.tv_sec,  
 	    (long int)state->data_rcv_ts.tv_usec, 
 	    (long int)state->seq_num,
@@ -950,13 +892,16 @@ generate_packet(int len) {
   struct udphdr *udp;
   struct pktgen_hdr *pktgen;
   struct timeval now;
+  uint32_t dst;
+  uint32_t src = (rand()%(obj_cfg.flow_num + 1));
+  while((dst = (rand()%(obj_cfg.flow_num + 1))) == src);
 
-  uint32_t src_ip = ntohl(inet_addr("10.2.0.0")) + ((rand()%(obj_cfg.flow_num + 1)) << 2) + 2;
-  uint32_t dst_ip = ntohl(inet_addr("10.3.0.0")) + (rand()%65533) + 4;
+  uint32_t src_ip = ntohl(inet_addr("10.2.0.0")) + (src<<2) + 2;
+  uint32_t dst_ip = ntohl(inet_addr("10.2.0.0")) + (dst<<2) + 2;
 
   ether = (struct ether_header *)pkt_buf;
-  memcpy(ether->ether_shost, "\x00\x0a\x5e\x54\x2c\xc0", ETH_ALEN); 
-  memcpy(ether->ether_dhost, "\x90\xe6\xba\x20\xb2\xbb", ETH_ALEN); 
+  memcpy(ether->ether_shost, obj_cfg.local_mac, ETH_ALEN); 
+  memcpy(ether->ether_dhost, obj_cfg.remote_mac, ETH_ALEN); 
   ether->ether_type = htons(ETHERTYPE_IP);
 
   ip = (struct iphdr *)(pkt_buf + ETHER_HDR_LEN);
@@ -972,7 +917,8 @@ generate_packet(int len) {
   ip->check =  Checksum((uint16_t *)ip, 20);
   
   udp = (struct udphdr *)(pkt_buf + ETHER_HDR_LEN + sizeof(struct iphdr));
-  udp->source = htons((rand()%60000) + 5000 );
+  //udp->source = htons((rand()%60000) + 5000 );
+  udp->source = htons(10000 + dst);
   udp->dest =  htons(7);
   udp->len = htons(len -  ETHER_HDR_LEN - sizeof(struct iphdr));
   udp->check = 0; //htons(0x4a77);
@@ -984,7 +930,7 @@ generate_packet(int len) {
   pktgen->echo_snd_tv_sec = htonl(now.tv_sec);
   pktgen->echo_snd_tv_usec = htonl(now.tv_usec);
   
-  if(pkt_count % 1000 == 0)
+  if(pkt_count % 1000000 == 0)
     printf("seding packet %d\n", pkt_count);
 
   send_data_raw_socket(obj_cfg.data_dev_fd, obj_cfg.data_dev_ix, pkt_buf, len);
@@ -1031,6 +977,8 @@ initialize_raw_socket() {
     exit(1);
   }
   obj_cfg.data_dev_ix = ifr.ifr_ifindex;
+
+
   memset(&saddrll, 0, sizeof(saddrll));
   saddrll.sll_family = AF_PACKET;
   saddrll.sll_protocol = ETH_P_ALL;
@@ -1040,27 +988,38 @@ initialize_raw_socket() {
     exit(1);
   }
 
-  obj_cfg.echo_dev_fd = socket(AF_PACKET,SOCK_RAW, htons(ETH_P_ALL));
-  if( obj_cfg.echo_dev_fd == -1) {
-    perror("raw socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))");
-    exit(1);
-  }
-  
-  // bind to a specific port
-  strncpy(ifr.ifr_name, obj_cfg.echo_dev_name,IFNAMSIZ);
-  if( ioctl(obj_cfg.echo_dev_fd, SIOCGIFINDEX, &ifr)  == -1 ) {
+  if( ioctl(obj_cfg.data_dev_fd, SIOCGIFHWADDR, &ifr) ) {
     perror("ioctl()");
-    exit(1);
+    exit(1);    
   }
-  obj_cfg.echo_dev_ix = ifr.ifr_ifindex;
-  memset(&saddrll, 0, sizeof(saddrll));
-  saddrll.sll_family = AF_PACKET;
-  saddrll.sll_protocol = ETH_P_ALL;
-  saddrll.sll_ifindex = ifr.ifr_ifindex;
-  if ( bind(obj_cfg.echo_dev_fd, (struct sockaddr *) &saddrll, sizeof(struct sockaddr_ll)) == -1 ) {
-    perror("bind()");
-    exit(1);
-  }
+  memcpy(obj_cfg.local_mac, ifr.ifr_hwaddr.sa_data, ETHER_ADDR_LEN);
+  
+  printf("local mac address : %02x:%02x:%02x:%02x:%02x:%02x\n", (uint8_t)ifr.ifr_hwaddr.sa_data[0],  
+	 (uint8_t)ifr.ifr_hwaddr.sa_data[1], (uint8_t)ifr.ifr_hwaddr.sa_data[2], 
+	 (uint8_t)ifr.ifr_hwaddr.sa_data[3],  (uint8_t)ifr.ifr_hwaddr.sa_data[4], 
+	 (uint8_t)ifr.ifr_hwaddr.sa_data[5]);
+  
+/*   obj_cfg.echo_dev_fd = socket(AF_PACKET,SOCK_RAW, htons(ETH_P_ALL)); */
+/*   if( obj_cfg.echo_dev_fd == -1) { */
+/*     perror("raw socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))"); */
+/*     exit(1); */
+/*   } */
+  
+/*   // bind to a specific port */
+/*   strncpy(ifr.ifr_name, obj_cfg.echo_dev_name,IFNAMSIZ); */
+/*   if( ioctl(obj_cfg.echo_dev_fd, SIOCGIFINDEX, &ifr)  == -1 ) { */
+/*     perror("ioctl()"); */
+/*     exit(1); */
+/*   } */
+/*   obj_cfg.echo_dev_ix = ifr.ifr_ifindex; */
+/*   memset(&saddrll, 0, sizeof(saddrll)); */
+/*   saddrll.sll_family = AF_PACKET; */
+/*   saddrll.sll_protocol = ETH_P_ALL; */
+/*   saddrll.sll_ifindex = ifr.ifr_ifindex; */
+/*   if ( bind(obj_cfg.echo_dev_fd, (struct sockaddr *) &saddrll, sizeof(struct sockaddr_ll)) == -1 ) { */
+/*     perror("bind()"); */
+/*     exit(1); */
+/*   } */
 }
 
 int 
@@ -1080,10 +1039,12 @@ main(int argc, char **argv) {
     exit(1);
   }
 
+  memcpy(obj_cfg.remote_mac, "\x90\xe6\xba\x20\xb2\xbb", 6);
   initialize_raw_socket();
   init_pcap();
   install_flows();
   initialize_snmp();
+
 
   if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) 
       || (pthread_create( &thrd_echo, NULL, echo_generate, NULL)) 
