@@ -19,6 +19,7 @@
 #include <curl/curl.h>
 
 #include <libconfig.h>
+#include <gsl/gsl_statistics.h>
 
 struct pktgen_hdr {
   uint32_t magic;
@@ -77,6 +78,12 @@ struct test_cfg {
 } obj_cfg;
 
 int my_read_objid(char *in_oid, oid *out_oid, size_t *out_oid_len);
+
+uint32_t
+timediff(struct timeval *now, struct timeval *last_pkt) {
+  return (now->tv_sec - last_pkt->tv_sec) * 1000000 +
+    (now->tv_usec - last_pkt->tv_usec);
+}
 
 int 
 load_cfg(struct test_cfg *test_cfg, const char *config) {
@@ -280,6 +287,15 @@ curl_write_method(char *buffer, size_t size,
 void
 destroy_cfg() {
   struct pcap_stat ps;
+  struct timeval now;
+  if(pcap_stats(obj_cfg.pcap, &ps) < 0) {
+    printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.pcap));
+  } else {
+    gettimeofday(&now, NULL);
+    fprintf(obj_cfg.snmp_file,"%ld.%06ld;pcap_stat;%u;%u;%u\n",
+	    now.tv_sec, now.tv_usec, ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+  }
+
 
   fclose(obj_cfg.pkt_file);
   fclose(obj_cfg.snmp_file);
@@ -288,7 +304,7 @@ destroy_cfg() {
   if(pcap_stats(obj_cfg.pcap, &ps) < 0) {
     printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.pcap));
   } else {
-    printf("pcap stat : %u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+    printf("pcap_stat;%u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
   }
 
   pcap_close(obj_cfg.pcap);
@@ -442,16 +458,22 @@ extract_headers(uint8_t *data, uint32_t data_len, struct nw_hdr *hdr) {
   return 1;
 }
 
+int data_count = 0; 
+double delay_data[25000000];
+
 void 
 process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   struct nw_hdr *hdr = (struct nw_hdr *)malloc(sizeof(struct nw_hdr));
   char nw_src[20], nw_dst[20];
   struct pkt_state *state;
+  struct timeval snd_ts;
+  uint32_t delay;
 
   bzero(hdr,sizeof(struct nw_hdr));
-  if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr)) {
-    state = malloc(sizeof(struct pkt_state));
-    bzero(state,sizeof(struct pkt_state));
+  if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr) &&
+     (hdr->ip->daddr != inet_addr("255.255.255.255"))) {
+    //state = malloc(sizeof(struct pkt_state));
+    //bzero(state,sizeof(struct pkt_state));
     /* printf("%ld.%06ld;%ld.%06ld;%ld;%s\n",   */
     /* 	    (long int)pkt_header->ts.tv_sec,   */
     /* 	    (long int)pkt_header->ts.tv_usec,  */
@@ -459,13 +481,18 @@ process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
     /* 	    (long int)ntohl(hdr->pktgen->tv_usec), */
     /* 	    (long int) ntohl(hdr->pktgen->seq_num), */
     /* 	    (char *)inet_ntoa(hdr->ip->daddr));   */
-
-    state->seq_num = ntohl(hdr->pktgen->seq_num);
-    state->rcv_ts.tv_sec = pkt_header->ts.tv_sec;
-    state->rcv_ts.tv_usec = pkt_header->ts.tv_usec;
-    state->snd_ts.tv_sec = ntohl(hdr->pktgen->tv_sec);
-    state->snd_ts.tv_usec = ntohl(hdr->pktgen->tv_usec);
-    state->nw_dst = hdr->ip->daddr;
+    snd_ts.tv_sec = ntohl(hdr->pktgen->tv_sec);
+    snd_ts.tv_usec = ntohl(hdr->pktgen->tv_usec);
+    if((delay = timediff(&pkt_header->ts, &snd_ts)) < 10000000) {
+      delay_data[data_count] = delay;
+      data_count++;
+    }
+/*     state->seq_num = ntohl(hdr->pktgen->seq_num); */
+/*     state->rcv_ts.tv_sec = pkt_header->ts.tv_sec; */
+/*     state->rcv_ts.tv_usec = pkt_header->ts.tv_usec; */
+/*     state->snd_ts.tv_sec = ntohl(hdr->pktgen->tv_sec); */
+/*     state->snd_ts.tv_usec = ntohl(hdr->pktgen->tv_usec); */
+/*     state->nw_dst = hdr->ip->daddr; */
     /* printf("%ld.%06ld;%ld.%06ld;%ld;%s\n",   */
     /* 	    (long int)state->rcv_ts.tv_sec,   */
     /* 	    (long int)state->rcv_ts.tv_usec,  */
@@ -474,7 +501,7 @@ process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
     /* 	    (long int)state->seq_num, */
     /* 	    (char *)inet_ntoa(state->nw_dst));   */
 
-    TAILQ_INSERT_TAIL(&head, state, entries);
+    //TAILQ_INSERT_TAIL(&head, state, entries);
   }
 }
 
@@ -509,14 +536,19 @@ get_snmp_status(struct timeval *ts) {
 	memcpy(sp, vars->val.string, vars->val_len);
 	sp[vars->val_len] = '\0';
 	fprintf(obj_cfg.snmp_file, "%ld.%06ld cpu 1 %s\n", ts->tv_sec, ts->tv_usec,sp);
+	printf("%ld.%06ld cpu 1 %s\n", ts->tv_sec, ts->tv_usec,sp);
 	free(sp);
       } else if ((vars->type == ASN_INTEGER)  || (vars->type == 0x41)) {
 	if( memcmp(vars->name, obj_cfg.pkt_in_OID, obj_cfg.pkt_in_OID_len*sizeof(int)) == 0) 
-	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_in;1;%lu\n", ts->tv_sec, ts->tv_usec, 
+	  fprintf(obj_cfg.snmp_file, "%ld.%06ld pkt_in 1 %lu\n", ts->tv_sec, ts->tv_usec, 
+		  *vars->val.integer);
+	  printf( "%ld.%06ld pkt_in 1 %lu\n", ts->tv_sec, ts->tv_usec, 
 		  *vars->val.integer);
 	
 	if( memcmp(vars->name, obj_cfg.pkt_out_OID, obj_cfg.pkt_out_OID_len*sizeof(int)) == 0) 
-	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_out;1;%lu\n", ts->tv_sec, ts->tv_usec, 
+	  fprintf(obj_cfg.snmp_file, "%ld.%06ld pkt_out 1 %lu\n", ts->tv_sec, ts->tv_usec, 
+		  *vars->val.integer); 
+	  printf("%ld.%06ld pkt_out 1 %lu\n", ts->tv_sec, ts->tv_usec, 
 		  *vars->val.integer);
 	
       } else 
@@ -540,8 +572,8 @@ packet_capture( void *ptr ) {
   const u_char *pkt_data;
   int ret;
 
-  gettimeofday(&last_snmp, NULL);
-  get_snmp_status(&last_snmp);
+  //gettimeofday(&last_snmp, NULL);
+  //get_snmp_status(&last_snmp);
   
   while(!obj_cfg.finished) {       
     /* Initialize the file descriptor set. */
@@ -559,8 +591,8 @@ packet_capture( void *ptr ) {
     }
       
     if(( timeout.tv_sec <= 0)) {
-      memcpy(&last_snmp, &now, sizeof(struct timeval));
-      get_snmp_status(&last_snmp);
+      //memcpy(&last_snmp, &now, sizeof(struct timeval));
+      //get_snmp_status(&last_snmp);
       //printf("send snmp now:%ld\n", now.tv_sec, last_snmp.tv_sec);
       timeout.tv_sec = 10;
       timeout.tv_usec = 0;
@@ -574,8 +606,8 @@ packet_capture( void *ptr ) {
     }
     if(ret == 0) {
       gettimeofday(&last_snmp, NULL);
-      get_snmp_status(&last_snmp);
-      printf("send snmp %ld\n", last_snmp.tv_sec);
+      //get_snmp_status(&last_snmp);
+      //printf("send snmp %ld\n", last_snmp.tv_sec);
     } else {
        /* Service all the sockets with input pending. */
       if (FD_ISSET(obj_cfg.pcap_fd, &set))  {
@@ -671,24 +703,37 @@ packet_generate( void *ptr ) {
   //start packet generation
   printf_and_check("/proc/net/pktgen/pgctrl", "start");
 
+  printf("Finished running the code\n");
+
+  //wait a minute before terminating to read any pending packets. 
+  gettimeofday(&start, NULL);
+  do {
+    gettimeofday(&now, NULL);
+    pthread_yield();
+  }while(timediff(&now, &start) <= 60000000);
+
   obj_cfg.finished = 1;
 };
 
 void
 process_data() {
-  struct pkt_state *state;
-  while (head.tqh_first != NULL) {
-    state = head.tqh_first;
-    fprintf(obj_cfg.pkt_file, "%ld.%06ld %ld.%06ld %ld %s\n",  
-	    (long int)state->rcv_ts.tv_sec,  
-	    (long int)state->rcv_ts.tv_usec, 
-	    (long int)state->snd_ts.tv_sec,  
-	    (long int)state->snd_ts.tv_usec,
-	    (long int)state->seq_num,
-	    (char *)inet_ntoa(state->nw_dst));  
-    TAILQ_REMOVE(&head, head.tqh_first, entries);
-    free(state);
-  }
+  struct pkt_state *state;  
+  double mean, variance, largest, smallest, median;
+
+  gsl_sort (delay_data, 1, data_count);
+  mean     = gsl_stats_mean(delay_data, 1, data_count);
+  variance = gsl_stats_absdev_m(delay_data, 1, data_count, mean);
+  median = gsl_stats_median_from_sorted_data(delay_data, 1, data_count);
+  largest  = gsl_stats_max(delay_data, 1, data_count);
+  smallest = gsl_stats_min(delay_data, 1, data_count);
+      
+  fprintf(obj_cfg.pkt_file, "%g %g %g %g %g %lu\n", mean,median, variance, 
+	  largest, smallest, data_count); 
+  printf("%g %g %g %g %g %lu\n", mean,median, variance,  largest, smallest, 
+	 data_count); 
+
+  //free(data);
+
   //fclose(obj_cfg.pkt_file);
 };
 
@@ -735,7 +780,9 @@ main(int argc, char **argv) {
   initialize_snmp();
   init_pcap();
   install_flows();
-
+  struct timeval last_snmp;
+  gettimeofday(&last_snmp, NULL);
+  get_snmp_status(&last_snmp);
   if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) ||
       (pthread_create( &thrd_generate, NULL, packet_generate, NULL))) {
     perror("pthread_create");
@@ -744,6 +791,8 @@ main(int argc, char **argv) {
 
   pthread_join(thrd_capture, NULL);
   pthread_join(thrd_generate, NULL); 
+  gettimeofday(&last_snmp, NULL);
+  get_snmp_status(&last_snmp);
 
   process_data();
   destroy_cfg();
