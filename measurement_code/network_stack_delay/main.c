@@ -26,6 +26,7 @@
 #include <netlink/socket.h>
 #include <netlink/route/link.h> 
 #include <netlink/route/addr.h> 
+#include <pthread.h>
 
 #include <glib-object.h>
 #include <json-glib/json-glib.h>
@@ -36,31 +37,28 @@
 #include <curl/curl.h>
 
 #include <libconfig.h>
+#include <gsl/gsl_statistics.h>
 
 uint8_t pkt_buf[3000];
 uint32_t pkt_count = 0;
+pthread_t thrd_capture, thrd_echo, thrd_data;
+
+int data_count = 0; 
+double delay_data[25000000];
 
 struct pktgen_hdr {
-  uint32_t id;
-  uint32_t echo_snd_tv_sec;
-  uint32_t echo_snd_tv_usec;
-  uint32_t echo_rcv_tv_sec;
-  uint32_t echo_rcv_tv_usec;
+  uint32_t magic;
+  uint32_t seq_num;
+  uint32_t tv_sec;
+  uint32_t tv_usec;
 };
+
 struct nw_hdr {
   struct ether_header *ether;
   struct iphdr *ip;
   struct udphdr *udp;
   struct pktgen_hdr *pktgen;
 };
-
-struct pkt_state {
-  uint32_t seq_num;
-  struct timeval data_rcv_ts, echo_snd_ts, data_snd_ts;
-  uint32_t nw_dst;
-  TAILQ_ENTRY(pkt_state) entries;
-};
-TAILQ_HEAD(tailhead, pkt_state) head;
 
 struct test_cfg {
 
@@ -115,6 +113,20 @@ uint16_t Checksum(const uint16_t* buf, unsigned int nbytes) {
   sum  = (sum >> 16) + (sum & 0xFFFF);
   sum += (sum >> 16);
   return ~sum;
+}
+
+uint32_t
+timediff(struct timeval *now, struct timeval *last_pkt) {
+  return (now->tv_sec - last_pkt->tv_sec) * 1000000 +
+    (now->tv_usec - last_pkt->tv_usec);
+}
+
+char buf[100];
+char *
+my_inet_ntoa (struct in_addr in) {
+  uint32_t ip = ntohl(in.s_addr);
+  snprintf(buf, 100, "%d.%d.%d.%d", (ip&0xFF000000)>>24, (ip&0xFF0000)>>16, (ip&0xFF00)>>8, ip&0xFF);
+  return buf;
 }
 
 int 
@@ -303,16 +315,16 @@ curl_write_method(char *buffer, size_t size,
 void
 destroy_cfg() {
   struct pcap_stat ps;
-
-  fclose(obj_cfg.pkt_file);
-  fclose(obj_cfg.snmp_file);
-
   //print pcap capture stats
   if(pcap_stats(obj_cfg.data_pcap, &ps) < 0) {
     printf("Failed to get stats:%s\n", pcap_geterr(obj_cfg.data_pcap));
   } else {
     printf("pcap stat : %u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+    fprintf("pcap_stat;%u;%u;%u\n",ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
   }
+
+  fclose(obj_cfg.pkt_file);
+  fclose(obj_cfg.snmp_file);
 
   pcap_close(obj_cfg.data_pcap);
 };
@@ -350,11 +362,14 @@ install_flows() {
     
     //set url
     addr.s_addr = obj_cfg.server_ip;
-    snprintf(msg, 1024, "https://%s/ws.v1/network_stack_test/installflows/%d/%02x:%02x:%02x:%02x:%02x:%02x", 
-	     (char *)inet_ntoa(addr), 
-	     obj_cfg.flow_num, (uint8_t)obj_cfg.local_mac[0], (uint8_t)obj_cfg.local_mac[1], 
-	     (uint8_t)obj_cfg.local_mac[2], (uint8_t)obj_cfg.local_mac[3], 
-	     (uint8_t)obj_cfg.local_mac[4], (uint8_t)obj_cfg.local_mac[5]);
+    /* snprintf(msg, 1024, "https://%s/ws.v1/network_stack_test/installflows/%d/%02x:%02x:%02x:%02x:%02x:%02x",  */
+    /* 	     (char *)my_inet_ntoa(addr),  */
+    /* 	     obj_cfg.flow_num, (uint8_t)obj_cfg.local_mac[0], (uint8_t)obj_cfg.local_mac[1],  */
+    /* 	     (uint8_t)obj_cfg.local_mac[2], (uint8_t)obj_cfg.local_mac[3],  */
+    /* 	     (uint8_t)obj_cfg.local_mac[4], (uint8_t)obj_cfg.local_mac[5]); */
+    /* curl_easy_setopt(curl, CURLOPT_URL, msg); */
+    snprintf(msg, 1024, "https://%s/ws.v1/network_stack_test/installflows/%d", 
+	     (char *)my_inet_ntoa(addr), obj_cfg.flow_num);
     curl_easy_setopt(curl, CURLOPT_URL, msg);
     
     // this is an http get request
@@ -377,7 +392,7 @@ install_flows() {
 
       printf("%s\n", curl_buf);
 
-      //load json data to a json parser
+      //load json data t]o a json parser
       error = NULL;
       json_parser_load_from_data(parser, curl_buf, curl_buf_len, &error);
       if (error) {
@@ -397,16 +412,16 @@ install_flows() {
       json_reader_end_element (reader); 
 
       reader = json_reader_new(root);
-      if(success) {
-	json_reader_read_member (reader, "bridge_mac");
-	char *bridge_mac = json_reader_get_string_value(reader);
-	printf("received mac : %s\n", bridge_mac);
+/*       if(success) { */
+/* 	json_reader_read_member (reader, "bridge_mac"); */
+/* 	char *bridge_mac = json_reader_get_string_value(reader); */
+/* 	printf("received mac : %s\n", bridge_mac); */
 
-/* 	sscanf(bridge_mac, "%02x:%02x:%02x:%02x:%02x:%02x", (uint8_t *)&obj_cfg.remote_mac[0],  */
-/* 	       (uint8_t *)&obj_cfg.remote_mac[1], (uint8_t *)&obj_cfg.remote_mac[2],  */
-/* 	       (uint8_t *)&obj_cfg.remote_mac[3], (uint8_t *)&obj_cfg.remote_mac[4],  */
-/* 	       (uint8_t *)&obj_cfg.remote_mac[5]); */
-      }
+/* /\* 	sscanf(bridge_mac, "%02x:%02x:%02x:%02x:%02x:%02x", (uint8_t *)&obj_cfg.remote_mac[0],  *\/ */
+/* /\* 	       (uint8_t *)&obj_cfg.remote_mac[1], (uint8_t *)&obj_cfg.remote_mac[2],  *\/ */
+/* /\* 	       (uint8_t *)&obj_cfg.remote_mac[3], (uint8_t *)&obj_cfg.remote_mac[4],  *\/ */
+/* /\* 	       (uint8_t *)&obj_cfg.remote_mac[5]); *\/ */
+/*       } */
       json_reader_end_element (reader);
       printf("result:%d\n", success);
 
@@ -419,6 +434,76 @@ install_flows() {
     curl_easy_cleanup(curl);
   }
 }
+
+
+void *
+packet_generate( void *ptr ) {
+  struct timeval start, now;
+  char intf_file[1024], msg[1024];
+  FILE *file;
+  struct in_addr addr;
+
+  printf_and_check("/proc/net/pktgen/kpktgend_0",  "rem_device_all");
+
+  snprintf(msg, 1024, "add_device %s", obj_cfg.data_dev_name);
+  printf_and_check("/proc/net/pktgen/kpktgend_0",msg );
+
+  snprintf(intf_file, 1024, "/proc/net/pktgen/%s",obj_cfg.data_dev_name);
+  printf_and_check(intf_file, "clone_skb 0");
+  uint32_t delay = (uint32_t)((8*obj_cfg.pkt_size*1000)/(obj_cfg.data_rate));
+  snprintf(msg, 1024, "delay %lu", (long unsigned int)delay);
+  printf("delay %lu\n", (long unsigned int)delay);
+  printf_and_check(intf_file, msg);
+
+  printf_and_check(intf_file,  "delay 0");
+
+  snprintf(msg, 1024, "count %lu", 
+	   (long unsigned int)(obj_cfg.duration*(1000000000/delay)));
+  printf("duration %d delay %d count %lu\n", obj_cfg.duration, delay,
+	 (long unsigned int)(obj_cfg.duration*(1000000000/delay)));
+  printf_and_check(intf_file, msg);
+  snprintf(msg, 1024, "pkt_size %d", obj_cfg.pkt_size);
+  printf_and_check(intf_file, msg);
+
+  printf_and_check(intf_file,  "dst_min 10.2.0.0");
+  addr.s_addr = htonl(ntohl(inet_addr("10.2.0.0")) + ((obj_cfg.flow_num)<<2));
+  snprintf(msg, 1024, "dst_max %s", (char *)my_inet_ntoa(addr)); 
+  printf_and_check(intf_file, msg);
+
+  printf_and_check(intf_file, "src_min 10.2.0.0");
+  addr.s_addr = htonl(ntohl(inet_addr("10.2.0.0")) + ((obj_cfg.flow_num)<<2));
+  snprintf(msg, 1024, "src_max %s", (char *)my_inet_ntoa(addr)); 
+  printf_and_check(intf_file, msg);
+
+  printf_and_check(intf_file,"flag IPDST_RND");
+   printf_and_check(intf_file,"flag IPSRC_RND");
+
+  snprintf(msg, 1024, "vlan_id %ld", (long int)0xffff);
+  printf_and_check(intf_file, msg);
+  printf_and_check(intf_file, "vlan_p 0"); 
+  printf_and_check(intf_file, "vlan_cfi 0"); 
+  printf_and_check(intf_file, "dst_mac 90:e6:ba:21:16:08");
+  printf_and_check(intf_file, "src_mac 00:25:64:bd:ea:47");
+  printf_and_check(intf_file, "tos 0");
+  printf_and_check(intf_file, "udp_src_max 7");
+  printf_and_check(intf_file, "udp_src_min 7");
+  printf_and_check(intf_file, "udp_dst_max 7");
+  printf_and_check(intf_file, "udp_dst_min 7");
+
+  //start packet generation
+  printf_and_check("/proc/net/pktgen/pgctrl", "start");
+
+  printf("Finished running the code\n");
+
+  //wait a minute before terminating to read any pending packets. 
+  gettimeofday(&start, NULL);
+  do {
+    gettimeofday(&now, NULL);
+    pthread_yield();
+  }while(timediff(&now, &start) <= 60000000);
+
+  obj_cfg.finished = 1;
+};
 
 int
 init_pcap() {
@@ -518,7 +603,9 @@ init_pcap() {
   } 	 
 
   char pcap_filter[1024];
-  sprintf(pcap_filter, "ether src host %02x:%02x:%02x:%02x:%02x:%02x", obj_cfg.remote_mac[0], 
+  sprintf(pcap_filter, 
+	  "ether src host %02x:%02x:%02x:%02x:%02x:%02x and udp port 7", 
+	  obj_cfg.remote_mac[0], 
 	  obj_cfg.remote_mac[1], obj_cfg.remote_mac[2], 
 	  obj_cfg.remote_mac[3], obj_cfg.remote_mac[4], 
 	  obj_cfg.remote_mac[5]);
@@ -538,10 +625,6 @@ init_pcap() {
     printf("pcap_open_live:%s\n", errbuf);
     exit(1);    
   }
-
-
-  //init in memory packet storage
-  TAILQ_INIT(&head);     
 };
 
 int
@@ -579,80 +662,19 @@ extract_headers(uint8_t *data, uint32_t data_len, struct nw_hdr *hdr) {
 void 
 process_pcap_pkt(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
   struct nw_hdr *hdr = (struct nw_hdr *)malloc(sizeof(struct nw_hdr));
-  char nw_src[20], nw_dst[20];
-  struct pkt_state *state;
+  uint32_t delay;
   bzero(hdr,sizeof(struct nw_hdr));
-  if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr)) {
-    state = malloc(sizeof(struct pkt_state));
-    bzero(state,sizeof(struct pkt_state));
-    /* printf("%ld.%06ld;%ld.%06ld;%ld.%06ld;%ld\n",   */
-    /* 	    (long int)ntohl(hdr->pktgen->echo_snd_tv_sec),   */
-    /* 	    (long int)ntohl(hdr->pktgen->echo_snd_tv_usec), */
-    /* 	    (long int)ntohl(hdr->pktgen->echo_rcv_tv_sec),   */
-    /* 	    (long int)ntohl(hdr->pktgen->echo_rcv_tv_usec), */
-    /* 	    (long int)pkt_header->ts.tv_sec,   */
-    /* 	    (long int)pkt_header->ts.tv_usec,  */
-    /* 	    (long int)ntohl(hdr->pktgen->id));   */
-    state->seq_num = ntohl(hdr->pktgen->id);
-    state->data_rcv_ts.tv_sec = pkt_header->ts.tv_sec;
-    state->data_rcv_ts.tv_usec = pkt_header->ts.tv_usec;
-    state->data_snd_ts.tv_sec = ntohl(hdr->pktgen->echo_snd_tv_sec);
-    state->data_snd_ts.tv_usec = ntohl(hdr->pktgen->echo_snd_tv_usec);
-    state->echo_snd_ts.tv_sec = ntohl(hdr->pktgen->echo_rcv_tv_sec);
-    state->echo_snd_ts.tv_usec = ntohl(hdr->pktgen->echo_rcv_tv_usec);
-    state->nw_dst = hdr->ip->daddr;
-    TAILQ_INSERT_TAIL(&head, state, entries);
+  struct timeval snd_ts;
+
+  if(extract_headers((uint8_t *)pkt_data, pkt_header->caplen, hdr) &&
+     (hdr->ip->daddr != inet_addr("255.255.255.255"))) {
+    snd_ts.tv_sec = ntohl(hdr->pktgen->tv_sec);
+    snd_ts.tv_usec = ntohl(hdr->pktgen->tv_usec);
+    if((delay = timediff(&pkt_header->ts, &snd_ts)) < 10000000) {
+      delay_data[data_count] = delay;
+      data_count++;
+    }
   }
-}
-
-void 
-generate_reply(const u_char *pkt_data,  struct pcap_pkthdr *pkt_header) {
-  char nw_src[20], nw_dst[20], *msg, tmp_mac[ETH_ALEN];
-  struct pkt_state *state;
-  struct ether_header *ether;
-  struct iphdr *ip;
-  struct udphdr *udp;
-  struct  pktgen_hdr *pktgen;
-  uint32_t tmp_ip;
-  uint16_t tmp_port;
-
-  msg = malloc(pkt_header->len);
-  memcpy(msg, pkt_data, pkt_header->caplen);
-
-  ether = (struct ether_header *)msg;
-  ip = (struct iphdr *)(msg + ETHER_HDR_LEN);
-  udp = (struct udphdr *)(msg + ETHER_HDR_LEN + sizeof(struct iphdr)); 
-  pktgen = (struct pktgen_hdr *)(msg + ETHER_HDR_LEN + sizeof(struct iphdr) + sizeof(struct udphdr)); 
-
-  if((ether->ether_type != htons(ETHERTYPE_IP)) ||
-     (ip->protocol != IPPROTO_UDP) ||
-     (udp->dest != htons(7))) {
-	printf("Invalid packet\n");
-    return;
-  }
-  //revert mac address
-  memcpy(tmp_mac, ether->ether_shost, ETH_ALEN); 
-  memcpy(ether->ether_shost, ether->ether_dhost, ETH_ALEN); 
-  memcpy(ether->ether_dhost, tmp_mac, ETH_ALEN); 
-  
-  //revert ip addr
-  tmp_ip = ip->saddr;
-  ip->saddr = ip->daddr;
-  ip->daddr = tmp_ip;
-  ip->check =  0;
-  ip->check =  Checksum((uint16_t *)ip, 20);
-  
-  //revert ip address
-  tmp_port = udp->source; 
-  udp->source = udp->dest; 
-  udp->dest = tmp_port;
-
-  //append timestamp
-  pktgen->echo_rcv_tv_sec = htonl(pkt_header->ts.tv_sec);
-  pktgen->echo_rcv_tv_usec = htonl(pkt_header->ts.tv_usec);
-  //  printf("%ld:%06ld packet received pkt %ld\n",ntohl(pktgen->echo_rcv_tv_sec), 
-  // ntohl(pktgen->echo_rcv_tv_usec), (long int) ntohl(pktgen->id)); 
-  //send_data_raw_socket(obj_cfg.echo_dev_fd, obj_cfg.echo_dev_ix, msg, pkt_header->len);
 }
 
 void
@@ -686,16 +708,19 @@ get_snmp_status(struct timeval *ts) {
 	memcpy(sp, vars->val.string, vars->val_len);
 	sp[vars->val_len] = '\0';
 	fprintf(obj_cfg.snmp_file, "%ld.%06ld;cpu;1;%s\n", ts->tv_sec, ts->tv_usec,sp);
+	printf("%ld.%06ld;cpu;1;%s\n", ts->tv_sec, ts->tv_usec,sp);
 	free(sp);
       } else if ((vars->type == ASN_INTEGER)  || (vars->type == 0x41)) {
-	if( memcmp(vars->name, obj_cfg.pkt_in_OID, obj_cfg.pkt_in_OID_len*sizeof(int)) == 0) 
+	if( memcmp(vars->name, obj_cfg.pkt_in_OID, (obj_cfg.pkt_in_OID_len*sizeof(int))) == 0) {
 	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_in;1;%ld\n", ts->tv_sec, ts->tv_usec, 
 		  *vars->val.integer);
-	
-	if( memcmp(vars->name, obj_cfg.pkt_out_OID, obj_cfg.pkt_out_OID_len*sizeof(int)) == 0) 
+	  printf("%ld.%06ld;pkt_in;1;%ld\n", ts->tv_sec, ts->tv_usec, *vars->val.integer);
+	} 
+	if( memcmp(vars->name, obj_cfg.pkt_out_OID, (obj_cfg.pkt_out_OID_len*sizeof(int))) == 0) {
 	  fprintf(obj_cfg.snmp_file, "%ld.%06ld;pkt_out;1;%ld\n", ts->tv_sec, ts->tv_usec, 
 		  *vars->val.integer);
-	
+	  printf("%ld.%06ld;pkt_out;1;%ld\n", ts->tv_sec, ts->tv_usec, *vars->val.integer);
+	}
       } else 
 	printf("Unkknown type ASN type : %x\n", vars->type);
     }
@@ -712,48 +737,26 @@ get_snmp_status(struct timeval *ts) {
 void *
 packet_capture( void *ptr ) {
   fd_set set;
-  struct timeval timeout, last_snmp, now;
+  struct timeval timeout, start, now;
   struct pcap_pkthdr *pkt_header;
   const u_char *pkt_data;
   int ret;
-
-  gettimeofday(&last_snmp, NULL);
-  get_snmp_status(&last_snmp);
   
+  gettimeofday(&start, NULL);
   while(!obj_cfg.finished) {       
     /* Initialize the file descriptor set. */
     FD_ZERO (&set);
     FD_SET(obj_cfg.data_pcap_fd, &set);
-    gettimeofday(&now, NULL);
-
     /* Initialize the timeout data structure. */
-    if((last_snmp.tv_usec - now.tv_usec) < 0) {
-      timeout.tv_usec = 1000000 + (last_snmp.tv_usec - now.tv_usec);
-      timeout.tv_sec = 9 - now.tv_sec + last_snmp.tv_sec;
-    } else {
-      timeout.tv_usec = (last_snmp.tv_usec - now.tv_usec);
-      timeout.tv_sec = 10 - now.tv_sec + last_snmp.tv_sec;
-    }
-      
-    if(( timeout.tv_sec <= 0)) {
-      memcpy(&last_snmp, &now, sizeof(struct timeval));
-      get_snmp_status(&last_snmp);
-      //printf("send snmp now:%ld\n", now.tv_sec, last_snmp.tv_sec);
-      timeout.tv_sec = 10;
-      timeout.tv_usec = 0;
-    }
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
 
-    //printf(" %ld.%06ld: timed out at %ld.%06ld\n", now.tv_sec, now.tv_usec, timeout.tv_sec, timeout.tv_usec);
     if( (ret = select(FD_SETSIZE, &set, NULL, NULL, 
 		      &timeout)) < 0) {
       perror("capture select");
       exit(1);
     }
-    if(ret == 0) {
-      gettimeofday(&last_snmp, NULL);
-      get_snmp_status(&last_snmp);
-      printf("send snmp %ld\n", last_snmp.tv_sec);
-    } else {
+    if(ret != 0) {
        /* Service all the sockets with input pending. */
       if (FD_ISSET(obj_cfg.data_pcap_fd, &set))  {
 	if(pcap_next_ex(obj_cfg.data_pcap, &pkt_header,
@@ -762,24 +765,18 @@ packet_capture( void *ptr ) {
 	  exit(1);
 	}
 	process_pcap_pkt(pkt_data, pkt_header);
-/*       } else if (FD_ISSET(obj_cfg.echo_pcap_fd, &set))  { */
-/* 	if(pcap_next_ex(obj_cfg.echo_pcap, &pkt_header, */
-/* 			&pkt_data) < 0) { */
-/* 	  perror("pcap_generate_reply"); */
-/* 	  exit(1); */
-/* 	} */
-/* 	generate_reply(pkt_data, pkt_header); */
+	gettimeofday(&now, NULL);
+	if(timediff(&now, &start) >= obj_cfg.duration*1000000) {
+	  printf("terminate execution\n");
+	  
+	  pthread_cancel(thrd_echo);
+	  break;
+	}
       } 
     }
   };
   printf("this is the packet capturer\n");
 };
-
-uint32_t
-timediff(struct timeval *now, struct timeval *last_pkt) {
-  return (now->tv_sec - last_pkt->tv_sec) * 1000000 +
-    (now->tv_usec - last_pkt->tv_usec);
-}
 
 void *
 echo_generate( void *ptr ) {
@@ -800,8 +797,6 @@ echo_generate( void *ptr ) {
     if (timediff(&now, &start) >= obj_cfg.duration*1000000) {
       break;
     } else if(timediff(&now, &last_pkt) >= delay ) {
-      /* printf("delay : %ld, now : %ld.%06ld, last : %ld.%06ld diff %ld\n", (long int)delay, now.tv_sec,  */
-      /* 	     now.tv_usec, last_pkt.tv_sec, last_pkt.tv_usec, (long int)timediff(&now, &last_pkt));  */
       generate_packet(obj_cfg.pkt_size);
       last_pkt.tv_usec += delay%1000000;
       if(last_pkt.tv_usec >= 1000000) {
@@ -814,10 +809,10 @@ echo_generate( void *ptr ) {
     //if(pkt_count >= 1) break;
   }
 
-/*   while(timediff(&now, &last_pkt) < 1800) { */
-/*     pthread_yield(); */
-/*     gettimeofday(&now, NULL);        */
-/*   } */
+   while(timediff(&now, &last_pkt) < 1800) { 
+     pthread_yield(); 
+     gettimeofday(&now, NULL);        
+   } 
   
 
   obj_cfg.finished = 1;
@@ -844,19 +839,19 @@ printf_and_check(char *filename, char *msg) {
 
 void
 process_data() {
-  struct pkt_state *state;
-  while (head.tqh_first != NULL) {
-    state = head.tqh_first;
-    fprintf(obj_cfg.pkt_file, "%ld.%06ld %ld.%06ld %ld %s\n",  
-	    (long int)state->data_snd_ts.tv_sec,  
-	    (long int)state->data_snd_ts.tv_usec,
-	    (long int)state->data_rcv_ts.tv_sec,  
-	    (long int)state->data_rcv_ts.tv_usec, 
-	    (long int)state->seq_num,
-	    (char *)inet_ntoa(state->nw_dst));  
-    TAILQ_REMOVE(&head, head.tqh_first, entries);
-    free(state);
-  }
+  double mean, variance, largest, smallest, median;
+
+  gsl_sort (delay_data, 1, data_count);
+  mean     = gsl_stats_mean(delay_data, 1, data_count);
+  variance = gsl_stats_absdev_m(delay_data, 1, data_count, mean);
+  median = gsl_stats_median_from_sorted_data(delay_data, 1, data_count);
+  largest  = gsl_stats_max(delay_data, 1, data_count);
+  smallest = gsl_stats_min(delay_data, 1, data_count);
+      
+  fprintf(obj_cfg.pkt_file, "%g %g %g %g %g %lu\n", mean,median, variance, 
+	  largest, smallest, data_count); 
+  printf("%g %g %g %g %g %lu\n", mean,median, variance,  largest, smallest, 
+	 data_count);
   //fclose(obj_cfg.pkt_file);
 };
 
@@ -873,7 +868,7 @@ initialize_snmp() {
    */
   snmp_sess_init( &obj_cfg.session );                   /* set up defaults */
   addr.s_addr = obj_cfg.server_ip;
-  obj_cfg.session.peername = strdup((char *)inet_ntoa(addr));
+  obj_cfg.session.peername = strdup((char *)my_inet_ntoa(addr));
     
   /* set the SNMP version number */
   obj_cfg.session.version = SNMP_VERSION_1;
@@ -917,18 +912,17 @@ generate_packet(int len) {
   ip->check =  Checksum((uint16_t *)ip, 20);
   
   udp = (struct udphdr *)(pkt_buf + ETHER_HDR_LEN + sizeof(struct iphdr));
-  //udp->source = htons((rand()%60000) + 5000 );
-  udp->source = htons(10000 + dst);
+  udp->source = htons(7);
   udp->dest =  htons(7);
   udp->len = htons(len -  ETHER_HDR_LEN - sizeof(struct iphdr));
   udp->check = 0; //htons(0x4a77);
 
   pktgen = (struct pktgen_hdr *)(pkt_buf + ETHER_HDR_LEN + sizeof(struct iphdr) 
 			     + sizeof(struct udphdr));
-  pktgen->id = htonl(++pkt_count);
-  gettimeofday(&now, NULL);
-  pktgen->echo_snd_tv_sec = htonl(now.tv_sec);
-  pktgen->echo_snd_tv_usec = htonl(now.tv_usec);
+  /* pktgen->id = htonl(++pkt_count); */
+  /* gettimeofday(&now, NULL); */
+  /* pktgen->snd_tv_sec = htonl(now.tv_sec); */
+  /* pktgen->snd_tv_usec = htonl(now.tv_usec); */
   
   if(pkt_count % 1000000 == 0)
     printf("seding packet %d\n", pkt_count);
@@ -998,33 +992,11 @@ initialize_raw_socket() {
 	 (uint8_t)ifr.ifr_hwaddr.sa_data[1], (uint8_t)ifr.ifr_hwaddr.sa_data[2], 
 	 (uint8_t)ifr.ifr_hwaddr.sa_data[3],  (uint8_t)ifr.ifr_hwaddr.sa_data[4], 
 	 (uint8_t)ifr.ifr_hwaddr.sa_data[5]);
-  
-/*   obj_cfg.echo_dev_fd = socket(AF_PACKET,SOCK_RAW, htons(ETH_P_ALL)); */
-/*   if( obj_cfg.echo_dev_fd == -1) { */
-/*     perror("raw socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))"); */
-/*     exit(1); */
-/*   } */
-  
-/*   // bind to a specific port */
-/*   strncpy(ifr.ifr_name, obj_cfg.echo_dev_name,IFNAMSIZ); */
-/*   if( ioctl(obj_cfg.echo_dev_fd, SIOCGIFINDEX, &ifr)  == -1 ) { */
-/*     perror("ioctl()"); */
-/*     exit(1); */
-/*   } */
-/*   obj_cfg.echo_dev_ix = ifr.ifr_ifindex; */
-/*   memset(&saddrll, 0, sizeof(saddrll)); */
-/*   saddrll.sll_family = AF_PACKET; */
-/*   saddrll.sll_protocol = ETH_P_ALL; */
-/*   saddrll.sll_ifindex = ifr.ifr_ifindex; */
-/*   if ( bind(obj_cfg.echo_dev_fd, (struct sockaddr *) &saddrll, sizeof(struct sockaddr_ll)) == -1 ) { */
-/*     perror("bind()"); */
-/*     exit(1); */
-/*   } */
 }
 
 int 
 main(int argc, char **argv) {
-  pthread_t thrd_capture, thrd_echo, thrd_data;
+  struct timeval now;
 
   if(argc < 1) {
     printf("Forgot to set the configuration file name\n");
@@ -1038,16 +1010,17 @@ main(int argc, char **argv) {
     printf("Failed to process configuration file\n");
     exit(1);
   }
-
-  memcpy(obj_cfg.remote_mac, "\x90\xe6\xba\x20\xb2\xbb", 6);
+  memcpy(obj_cfg.remote_mac, "\x90\xe6\xba\x21\x16\x08", 6);
   initialize_raw_socket();
   init_pcap();
   install_flows();
   initialize_snmp();
 
-
+  gettimeofday(&now, NULL);
+  get_snmp_status(&now);
   if( (pthread_create( &thrd_capture, NULL, packet_capture, NULL)) 
-      || (pthread_create( &thrd_echo, NULL, echo_generate, NULL)) 
+      || (pthread_create( &thrd_echo, NULL, packet_generate,NULL))
+      //      || (pthread_create( &thrd_echo, NULL, echo_generate, NULL)) 
       //|| (pthread_create( &thrd_data, NULL, data_generate, NULL)) 
       ) {
     perror("pthread_create");
@@ -1056,7 +1029,8 @@ main(int argc, char **argv) {
 
   pthread_join(thrd_capture, NULL);
   pthread_join(thrd_echo, NULL); 
-  //pthread_join(thrd_data, NULL); 
+  gettimeofday(&now, NULL);
+  get_snmp_status(&now);
 
   process_data();
   destroy_cfg();
