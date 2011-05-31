@@ -39,7 +39,7 @@ and install requires the following packages:
     $ sudo apt-get install autoconf automake libtool pkg-config g++ python \
            python-dev python-twisted swig libxerces-c2-dev libssl-dev make \
            libsqlite3-dev python-simplejson python-sphinx libboost1.40-dev \
-           libboost-filesystem1.40-dev libboost-test1.40-dev curl
+           libboost-filesystem1.40-dev libboost-test1.40-dev curl libnl2-dev
 
 Subsequent instructions assume `ROOT` is set to the directory into
 which you cloned this repository.
