@@ -104,6 +104,7 @@ network configuration changes.
     $ sudo ovs-vswitchd unix:/var/run/ovsdb-server 
 
 (5) Initialise the database, create the bridge, &c
+
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server init
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server add-br br0
     $ sudo ovs-vsctl --db=unix:/var/run/ovsdb-server set-fail-mode br0 secure
