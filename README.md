@@ -122,7 +122,7 @@ network configuration changes.
 
 (8) Permit a mac address to do anything; eaddr=xx:xx:xx:xx:xx:xx
 
-    $ curl --noproxy localhost -X POST http://localhost/ws.v1/homework/permit/<eaddr>
+    $ curl --noproxy localhost -X POST -k https://localhost/ws.v1/homework/permit/<eaddr>
 
 
 Interrogation
