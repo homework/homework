@@ -63,7 +63,24 @@ Building NoX
     $ mkdir build && cd build && ../configure
     $ make -j4 ; make
     $ cd src && make check
-    $ cd etc && for n in noxca.key* ; do mv $n ${n}.disabled ; done
+
+In case you wish to disable the ssl client authentication you can run the following command.
+
+	$ cd etc && for n in noxca.key* ; do mv $n ${n}.disabled ; done
+
+Generating client certification
+-------------------------------
+
+In case you wish to run a client authentication mechanism as part of the ssl negotiation protocol,
+a set of user signed keys should be generated. In order keys you should run the following commands
+
+	$ cd ${ROOT}/nox.git/build/src/etc/
+	$  ../../../src/etc/gen-client-cert.sh ../../../src/etc/
+
+After the last command two files (client.pem and client.p12) will be generated in folder 
+${ROOT}/nox.git/build/src/etc/, which can be used as keys for the client browser. Beware, that each 
+key singature should have a unique desctiprion, otherwise the script will not generate a valid 
+certificate.
 
 
 Starting the Homework Router
@@ -122,7 +139,11 @@ network configuration changes.
 
 (8) Permit a mac address to do anything; eaddr=xx:xx:xx:xx:xx:xx
 
-    $ curl --noproxy localhost -X POST -k https://localhost/ws.v1/homework/permit/<eaddr>
+    $ curl --cert client.pem --noproxy localhost -X POST -k https://localhost/ws.v1/homework/permit/<eaddr>
+	$ curl --noproxy localhost -X POST https://localhost/ws.v1/homework/permit/<eaddr>
+
+Alternatively, the user can bootstrap permitted mac address throught the file
+/etc/homework/whitelist.conf. In this file, a user can add a list of mac addresses, one on each line, which will be read during the initialization of the router. 
 
 
 Interrogation
@@ -130,7 +151,9 @@ Interrogation
 
 Permit/deny status of Homework router
 
-    $ curl --noproxy localhost -X GET http://localhost/ws.v1/homework/status 
+    $ curl --noproxy localhost -X GET -k --cert client.pem https://localhost/ws.v1/homework/status 
+	or
+	$ curl --noproxy localhost -X GET http://localhost/ws.v1/homework/status
 
 To see what flows have been installed in openvswitch
 
