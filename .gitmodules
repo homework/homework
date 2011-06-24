@@ -3,4 +3,4 @@
 	url =  git://github.com/homework/nox.git
 [submodule "openvswitch.git"]
 	path = openvswitch.git
-	url = git@github.com:homework/openvswitch.git
+	url = git://github.com/homework/openvswitch.git
