@@ -94,7 +94,7 @@ describes how to actually run things and control the Homework router.
 Steps (2) -- (4) will each startup processes that take control of the
 terminal, ie., will need running in separate terminals.  If you want,
 investigate the man pages for `ovsdb-server` and `ovs-vswitchd` to see
-how to run then as background daemons.
+how to run them as background daemons.
 
 Steps (2), (5) need only be carried out once, or whenever the eeePC
 network configuration changes.
