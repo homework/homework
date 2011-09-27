@@ -4,3 +4,6 @@
 [submodule "openvswitch.git"]
 	path = openvswitch.git
 	url = git://github.com/homework/openvswitch.git
+[submodule "homework-notify-server.git"]
+	path = homework-notify-server.git
+	url = git@github.com:homework/homework-notify-server.git
