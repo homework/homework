@@ -7,3 +7,6 @@
 [submodule "homework-notify-server.git"]
 	path = homework-notify-server.git
 	url = git@github.com:homework/homework-notify-server.git
+[submodule "homework-notify.git"]
+	path = homework-notify.git
+	url = git@github.com:homework/homework-notify.git
