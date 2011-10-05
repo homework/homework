@@ -12,4 +12,4 @@
 	url = git://github.com/homework/homework-notify.git
 [submodule "homework-devices.git"]
 	path = homework-devices.git
-	url = ssh://github.com/homework/homework-devices.git
+	url = git://github.com/homework/homework-devices.git
